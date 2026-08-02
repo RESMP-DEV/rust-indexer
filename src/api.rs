@@ -372,7 +372,7 @@ fn create_indexer_state(state: &SharedState, root_path: &Path) -> Arc<IndexerSta
         CodeWalker::from_config(config),
         splitter,
         embedder,
-        VectorStore::new(),
+        VectorStore::from_config(config),
         config.embedding_dimension,
         config.concurrency,
     ))

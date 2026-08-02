@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Share one index with rust_sindexer: restored the Milvus/Zilliz backend and
+  identity-scoped collection naming (`SINDEXER_COLLECTION_IDENTITY` /
+  `SINDEXER_COLLECTION_ROOT`), moved the manifest back to `<repo>/.sindexer/`
+  and the lexical cache back to `$XDG_CACHE_HOME/sindexer/`, and restored the
+  Milvus i64 id canonicalization in hybrid fusion. An index built by the MCP
+  server is searchable and updatable from this CLI and vice versa.
+- Auto-load `~/.context/.env` (existing environment wins) so the CLI sees the
+  same embedding and Milvus configuration as the sindexer wrapper script.
 - Initial fork from rust_sindexer (MCP server variant) as a standalone CLI.
 - Removed the MCP protocol surface (rmcp) and the Milvus/Zilliz vector
   backend; the local store is now the only vector backend.

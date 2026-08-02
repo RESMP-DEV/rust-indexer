@@ -266,11 +266,11 @@ pub fn fingerprint_files(root: &Path, files: &[PathBuf]) -> Result<Vec<FileFinge
 }
 
 fn manifest_path(root: &Path) -> PathBuf {
-    root.join(".rust-indexer").join("index-manifest.json")
+    root.join(".sindexer").join("index-manifest.json")
 }
 
 fn status_path(root: &Path) -> PathBuf {
-    root.join(".rust-indexer").join("index-status.json")
+    root.join(".sindexer").join("index-status.json")
 }
 
 #[cfg(test)]

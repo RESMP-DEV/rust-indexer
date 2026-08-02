@@ -283,7 +283,7 @@ fn cache_dir_for(path: &Path) -> Result<PathBuf> {
     let digest = hex::encode(hasher.finalize());
 
     Ok(home_cache_dir()?
-        .join("rust-indexer")
+        .join("sindexer")
         .join("lexical-indexes")
         .join(digest))
 }

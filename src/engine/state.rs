@@ -67,7 +67,7 @@ impl ContextState {
             Embedder::Disabled
         };
 
-        let vector_store = VectorStore::new();
+        let vector_store = VectorStore::from_config(&config);
 
         let splitter_config = crate::splitter::Config {
             max_chunk_bytes: config.chunk_size,
@@ -301,13 +301,23 @@ mod tests {
     }
 
     #[test]
+    fn test_milvus_url_selects_milvus_backend() {
+        let state = ContextState::new(Config {
+            milvus_url: "https://cluster.zillizcloud.com:443".to_string(),
+            ..Config::default()
+        });
+
+        assert!(matches!(state.vector_store, VectorStore::Milvus(_)));
+    }
+
+    #[test]
     fn test_get_status_prefers_persisted_non_idle_over_stale_idle() {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().to_path_buf();
         let state = ContextState::with_components(
             Config::default(),
             Embedder::Disabled,
-            VectorStore::new(),
+            VectorStore::Local(crate::vectordb::LocalStore::new()),
         );
 
         state.set_status(path.clone(), IndexStatus::default());

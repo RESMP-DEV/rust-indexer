@@ -6,15 +6,20 @@ dependencies on this one, nor vice versa.
 
 ## Contract
 
-- This is a CLI, not a server. There is no MCP surface, no Milvus/Zilliz
-  backend, and no daemon; do not reintroduce them.
+- This is a CLI, not a server. There is no MCP surface and no daemon; do not
+  reintroduce them.
+- Index compatibility with rust_sindexer is a hard requirement: collection
+  naming (identity scoping included), `<repo>/.sindexer/` manifest format,
+  `IndexInputs` equality semantics (including the ignore-pattern list), the
+  tantivy schema and cache path, and the Milvus metadata JSON layout must
+  all stay byte-compatible with the sibling repo. Breaking any of these
+  silently forces full reindexes for one tool or the other.
 - Every subcommand must work with zero configuration (lexical-only) and keep
   `--json` output stable for scripted callers.
-- Vector persistence is bincode with the typed `ChunkMeta` struct.
+- Local vector persistence is bincode with the typed `ChunkMeta` struct.
   serde_json::Value does not survive bincode round-trips; keep persisted
-  types self-describing-format-free.
-- Per-repo state lives in `<repo>/.rust-indexer/`; caches live under
-  `$XDG_CACHE_HOME/rust-indexer/`.
+  types self-describing-format-free. The local store is the only
+  non-shared surface (sindexer's local store is JSON).
 
 ## Layout
 

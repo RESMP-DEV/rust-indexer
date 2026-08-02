@@ -1153,7 +1153,7 @@ mod tests {
                 query_prefix: String::new(),
                 passage_prefix: String::new(),
             })),
-            VectorStore::new(),
+            VectorStore::Local(crate::vectordb::LocalStore::new()),
             dimension,
         )
     }
@@ -1168,7 +1168,7 @@ mod tests {
                 ..SplitterConfig::default()
             }),
             Embedder::Disabled,
-            VectorStore::new(),
+            VectorStore::Local(crate::vectordb::LocalStore::new()),
             384,
         )
     }
@@ -1270,7 +1270,7 @@ mod tests {
         let first_result = index_codebase(&state, root, false).await.unwrap();
         assert!(first_result.files_processed >= 2);
 
-        let manifest_path = root.join(".rust-indexer").join("index-manifest.json");
+        let manifest_path = root.join(".sindexer").join("index-manifest.json");
         assert!(manifest_path.exists());
 
         let second_result = index_codebase(&state, root, false).await.unwrap();
@@ -1377,7 +1377,7 @@ mod tests {
                 ..SplitterConfig::default()
             }),
             Embedder::Disabled,
-            VectorStore::new(),
+            VectorStore::Local(crate::vectordb::LocalStore::new()),
             384,
         );
 

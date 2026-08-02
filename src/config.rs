@@ -4,6 +4,7 @@ use tracing::{debug, info};
 
 const EMBEDDING_URL_ENV_KEYS: &[&str] = &["EMBEDDING_URL", "OPENAI_BASE_URL"];
 const EMBEDDING_API_KEY_ENV_KEYS: &[&str] = &["EMBEDDING_API_KEY", "OPENAI_API_KEY"];
+const MILVUS_URL_ENV_KEYS: &[&str] = &["MILVUS_URL", "MILVUS_ADDRESS"];
 
 /// Supported file extensions for indexing (without leading dot).
 pub const SUPPORTED_EXTENSIONS: &[&str] = &[
@@ -25,7 +26,6 @@ pub const DEFAULT_IGNORE_PATTERNS: &[&str] = &[
     ".svn",
     ".sindexer",
     ".rust_sindexer",
-    ".rust-indexer",
     ".worktrees",
     "agent_workspace",
     "logs",
@@ -53,6 +53,10 @@ pub struct Config {
     pub embedding_query_prefix: String,
     /// Prefix prepended to indexed code passages before embedding.
     pub embedding_passage_prefix: String,
+    /// URL for Milvus vector database. Empty uses the local vector store.
+    pub milvus_url: String,
+    /// Optional bearer token for authenticated Milvus-compatible endpoints.
+    pub milvus_token: Option<String>,
     /// Size of text chunks in characters.
     pub chunk_size: usize,
     /// Overlap between adjacent chunks in characters.
@@ -83,6 +87,8 @@ impl Default for Config {
             embedding_api_key: None,
             embedding_query_prefix: String::new(),
             embedding_passage_prefix: String::new(),
+            milvus_url: String::new(),
+            milvus_token: None,
             chunk_size: 512,
             chunk_overlap: 64,
             batch_size: 32,
@@ -116,6 +122,8 @@ impl Config {
                 .ok()
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or(defaults.embedding_passage_prefix),
+            milvus_url: first_non_empty_env(MILVUS_URL_ENV_KEYS).unwrap_or(defaults.milvus_url),
+            milvus_token: first_non_empty_env(&["MILVUS_TOKEN"]),
             chunk_size: env::var("CHUNK_SIZE")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -165,6 +173,7 @@ impl Config {
                 "disabled"
             },
             embedding_model = %config.embedding_model,
+            vector_store = if config.has_milvus_url() { "milvus" } else { "local" },
             chunk_size = config.chunk_size,
             batch_size = config.batch_size,
             concurrency = config.concurrency,
@@ -179,6 +188,11 @@ impl Config {
     #[inline]
     pub fn has_embedding_url(&self) -> bool {
         !self.embedding_url.is_empty()
+    }
+
+    #[inline]
+    pub fn has_milvus_url(&self) -> bool {
+        !self.milvus_url.is_empty()
     }
 
     /// Get effective thread count for parallel operations.
@@ -248,6 +262,9 @@ mod tests {
         "OPENAI_API_KEY",
         "EMBEDDING_QUERY_PREFIX",
         "EMBEDDING_PASSAGE_PREFIX",
+        "MILVUS_URL",
+        "MILVUS_ADDRESS",
+        "MILVUS_TOKEN",
     ];
 
     struct EnvGuard {
@@ -292,13 +309,18 @@ mod tests {
         let _guard = EnvGuard::new(&[
             ("EMBEDDING_URL", Some("https://api.openai.com/v1")),
             ("EMBEDDING_API_KEY", Some("secret")),
+            ("MILVUS_URL", Some("https://cluster.example.com:443")),
+            ("MILVUS_TOKEN", Some("token")),
         ]);
 
         let config = Config::from_env();
 
         assert_eq!(config.embedding_url, "https://api.openai.com/v1");
         assert_eq!(config.embedding_api_key.as_deref(), Some("secret"));
+        assert_eq!(config.milvus_url, "https://cluster.example.com:443");
+        assert_eq!(config.milvus_token.as_deref(), Some("token"));
         assert!(config.has_embedding_url());
+        assert!(config.has_milvus_url());
     }
 
     #[test]
@@ -307,13 +329,19 @@ mod tests {
         let _guard = EnvGuard::new(&[
             ("OPENAI_BASE_URL", Some("https://api.jina.ai/v1")),
             ("OPENAI_API_KEY", Some("jina-secret")),
+            (
+                "MILVUS_ADDRESS",
+                Some("https://cluster.zillizcloud.com:443"),
+            ),
         ]);
 
         let config = Config::from_env();
 
         assert_eq!(config.embedding_url, "https://api.jina.ai/v1");
         assert_eq!(config.embedding_api_key.as_deref(), Some("jina-secret"));
+        assert_eq!(config.milvus_url, "https://cluster.zillizcloud.com:443");
         assert!(config.has_embedding_url());
+        assert!(config.has_milvus_url());
     }
 
     #[test]
@@ -360,12 +388,16 @@ mod tests {
             ("EMBEDDING_URL", Some("  ")),
             ("OPENAI_BASE_URL", Some("")),
             ("EMBEDDING_API_KEY", Some("")),
+            ("MILVUS_URL", Some(" ")),
+            ("MILVUS_ADDRESS", Some("")),
         ]);
 
         let config = Config::from_env();
 
         assert_eq!(config.embedding_url, "");
         assert_eq!(config.embedding_api_key, None);
+        assert_eq!(config.milvus_url, "");
         assert!(!config.has_embedding_url());
+        assert!(!config.has_milvus_url());
     }
 }
