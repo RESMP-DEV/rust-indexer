@@ -1,0 +1,100 @@
+# rust-indexer
+
+Fast, local-first CLI for hybrid code search: BM25 lexical retrieval fused
+with optional semantic embeddings, in a single native binary.
+
+Point it at a codebase, index it once, then search from any shell or agent.
+No server process, no vector database, no configuration required.
+
+```bash
+rust-indexer index ~/code/my-project
+rust-indexer search "where do we retry failed uploads" -p ~/code/my-project
+```
+
+## Install
+
+```bash
+cargo build --release
+install -m 755 target/release/rust-indexer ~/.local/bin/
+```
+
+## Usage
+
+```
+rust-indexer index [PATH] [--force]    Build (or manifest-guided rebuild of) the index
+rust-indexer update [PATH]             Incremental update: changed/deleted files only
+rust-indexer search QUERY [-p PATH] [-k N] [-e EXT]...
+rust-indexer status [PATH]             Index state and counts
+rust-indexer clear [PATH]              Remove vector + lexical index for PATH
+rust-indexer collections               List indexed collections and row counts
+```
+
+`PATH` defaults to the current directory. Add `--json` to any command for
+machine-readable output (useful when calling from agents or scripts).
+
+## Modes
+
+- **Lexical only (default)** — zero configuration. Tantivy BM25 over
+  tree-sitter AST chunks. Good for symbols and exact terms.
+- **Hybrid semantic + lexical** — set `EMBEDDING_URL` to any OpenAI-compatible
+  embeddings endpoint. Results are fused with reciprocal rank fusion.
+
+## Storage
+
+- `<repo>/.rust-indexer/` — index manifest (per-file SHA-256) and status.
+- `$XDG_CACHE_HOME/rust-indexer/` (default `~/.cache/rust-indexer/`) —
+  binary (bincode) vector collections and tantivy lexical indexes.
+
+The binary vector format loads a 500-chunk collection in about a millisecond,
+so per-invocation cold start is negligible; search latency is dominated by
+the embedding endpoint when semantic mode is enabled.
+
+## Environment variables
+
+All optional.
+
+- `EMBEDDING_URL` — OpenAI-compatible embeddings base URL; enables semantic
+  search (`OPENAI_BASE_URL` also accepted).
+- `EMBEDDING_API_KEY` — bearer token if the endpoint needs one
+  (`OPENAI_API_KEY` also accepted).
+- `EMBEDDING_MODEL` — model name (default `all-minilm`).
+- `EMBEDDING_DIMENSION` — vector dimension, must match the model (default `384`).
+- `EMBEDDING_QUERY_PREFIX` / `EMBEDDING_PASSAGE_PREFIX` — task-instruction
+  prefixes for models that use them.
+- `EMBEDDING_RPM` / `EMBEDDING_TPM` — client-side rate limits (defaults 400 / 1.6M).
+- `CHUNK_SIZE`, `CHUNK_OVERLAP`, `BATCH_SIZE`, `INDEXING_CONCURRENCY`,
+  `MAX_FILE_SIZE`, `FOLLOW_SYMLINKS` — pipeline tuning.
+- `RUST_LOG` — tracing filter; logs go to stderr.
+
+## Architecture
+
+```
+Walker (ignore-aware) → Splitter (tree-sitter AST) → Embedder (HTTP, optional)
+                                   │                        │
+                              Lexical (tantivy BM25)   Vector store (bincode)
+                                   └────────┬───────────────┘
+                                     Hybrid fusion (RRF)
+```
+
+Incremental updates diff a per-file SHA-256 manifest and re-process only
+added, modified, and deleted files. `update` refuses to fall back to a full
+rebuild; use `index --force` when you actually want one.
+
+Supported AST languages: Python, JavaScript, TypeScript, TSX, Rust, Go, Java,
+C++, C, Ruby, PHP, Swift, Scala, C#. Other supported file types fall back to
+markdown-heading or line-based splitting.
+
+## Provenance
+
+Forked from [rust_sindexer](https://github.com/RESMP-DEV/rust_sindexer), the
+MCP server variant. This project deliberately drops the MCP protocol surface
+and the Milvus/Zilliz backend in favor of a plain CLI over local storage. If
+you need an MCP server or a remote vector database, use rust_sindexer.
+
+## Development
+
+```bash
+cargo test
+cargo clippy --all-targets
+cargo fmt
+```

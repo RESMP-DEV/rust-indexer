@@ -1,0 +1,335 @@
+//! MCP server shared state management.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use anyhow::Result;
+use dashmap::DashMap;
+
+use tracing::{debug, info, warn};
+
+use crate::config::Config;
+use crate::embedding::{Embedder, EmbeddingClient, EmbeddingConfig};
+use crate::engine::manifest::ManifestStore;
+use crate::splitter::CodeSplitter;
+use crate::types::{CodeChunk, EmbeddingVector, IndexState, IndexStatus};
+use crate::vectordb::VectorStore;
+
+/// Search result returned from code search operations.
+#[derive(Clone, Debug)]
+pub struct SearchResult {
+    pub chunk: CodeChunk,
+    pub score: f32,
+}
+
+/// Result of an indexing operation.
+#[derive(Clone, Debug)]
+pub struct IndexResult {
+    pub path: PathBuf,
+    pub files_indexed: usize,
+    pub chunks_created: usize,
+    pub success: bool,
+    pub error: Option<String>,
+}
+
+/// Result of clearing an index.
+#[derive(Clone, Debug)]
+pub struct ClearResult {
+    pub path: PathBuf,
+    pub success: bool,
+    pub error: Option<String>,
+}
+
+/// Shared state for the MCP server.
+pub struct ContextState {
+    pub config: Config,
+    pub embedder: Embedder,
+    pub vector_store: VectorStore,
+    pub manifest_store: Arc<ManifestStore>,
+    pub indexing_status: DashMap<PathBuf, IndexStatus>,
+    pub splitter: CodeSplitter,
+}
+
+impl ContextState {
+    pub fn new(config: Config) -> Self {
+        info!("initializing context state");
+        let embedder = if config.has_embedding_url() {
+            info!("embedding enabled via configured URL");
+            let embedding_config = EmbeddingConfig::from_config(&config);
+            let rate_limiter =
+                crate::embedding::RateLimiter::new(config.embedding_rpm, config.embedding_tpm);
+            Embedder::Http(EmbeddingClient::with_rate_limiter(
+                embedding_config,
+                rate_limiter,
+            ))
+        } else {
+            info!("embedding disabled (no embedding URL configured)");
+            Embedder::Disabled
+        };
+
+        let vector_store = VectorStore::new();
+
+        let splitter_config = crate::splitter::Config {
+            max_chunk_bytes: config.chunk_size,
+            overlap_lines: config.chunk_overlap / 80,
+            ..Default::default()
+        };
+        let splitter = CodeSplitter::new(splitter_config);
+
+        Self {
+            config,
+            embedder,
+            vector_store,
+            manifest_store: Arc::new(ManifestStore),
+            indexing_status: DashMap::new(),
+            splitter,
+        }
+    }
+
+    pub fn with_components(config: Config, embedder: Embedder, vector_store: VectorStore) -> Self {
+        let splitter_config = crate::splitter::Config {
+            max_chunk_bytes: config.chunk_size,
+            overlap_lines: config.chunk_overlap / 80,
+            ..Default::default()
+        };
+        let splitter = CodeSplitter::new(splitter_config);
+
+        Self {
+            config,
+            embedder,
+            vector_store,
+            manifest_store: Arc::new(ManifestStore),
+            indexing_status: DashMap::new(),
+            splitter,
+        }
+    }
+
+    pub fn with_defaults() -> Self {
+        Self::new(Config::default())
+    }
+
+    pub fn get_status(&self, path: &Path) -> IndexStatus {
+        let in_memory = self
+            .indexing_status
+            .get(&path.to_path_buf())
+            .map(|r| r.clone());
+        let persisted = self.manifest_store.load_status(path).ok().flatten();
+
+        match (in_memory, persisted) {
+            (Some(memory), Some(file))
+                if memory.status == IndexState::Idle && file.status != IndexState::Idle =>
+            {
+                file
+            }
+            (Some(memory), _) => memory,
+            (None, Some(file)) => file,
+            (None, None) => IndexStatus::default(),
+        }
+    }
+
+    pub fn set_status(&self, path: PathBuf, status: IndexStatus) {
+        self.indexing_status.insert(path.clone(), status.clone());
+        let _ = self.manifest_store.write_status(&path, &status);
+    }
+
+    pub fn start_indexing(&self, path: &Path, total_files: usize) {
+        info!(path = %path.display(), total_files, "starting indexing");
+        self.set_status(
+            path.to_path_buf(),
+            IndexStatus {
+                total_files,
+                processed_files: 0,
+                total_chunks: 0,
+                embeddings_generated: 0,
+                vectors_inserted: 0,
+                status: IndexState::Indexing,
+            },
+        );
+    }
+
+    pub fn update_progress(&self, path: &Path, processed_files: usize, total_chunks: usize) {
+        if let Some(mut status) = self.indexing_status.get_mut(&path.to_path_buf()) {
+            status.processed_files = processed_files;
+            status.total_chunks = total_chunks;
+            let snapshot = status.clone();
+            drop(status);
+            let _ = self.manifest_store.write_status(path, &snapshot);
+        }
+    }
+
+    pub fn complete_indexing(&self, path: &Path, total_chunks: usize) {
+        info!(path = %path.display(), total_chunks, "indexing completed");
+        if let Some(mut status) = self.indexing_status.get_mut(&path.to_path_buf()) {
+            status.processed_files = status.total_files;
+            status.total_chunks = total_chunks;
+            status.status = IndexState::Completed;
+            let snapshot = status.clone();
+            drop(status);
+            let _ = self.manifest_store.write_status(path, &snapshot);
+        }
+    }
+
+    pub fn fail_indexing(&self, path: &Path) {
+        warn!(path = %path.display(), "indexing failed");
+        if let Some(mut status) = self.indexing_status.get_mut(&path.to_path_buf()) {
+            status.status = IndexState::Failed;
+            let snapshot = status.clone();
+            drop(status);
+            let _ = self.manifest_store.write_status(path, &snapshot);
+        }
+    }
+
+    pub fn is_indexing(&self, path: &Path) -> bool {
+        self.indexing_status
+            .get(&path.to_path_buf())
+            .map(|r| r.status == IndexState::Indexing)
+            .unwrap_or(false)
+    }
+
+    pub async fn embed(&self, text: &str) -> Result<EmbeddingVector> {
+        self.embedder.embed(text).await
+    }
+
+    pub async fn embed_batch(&self, texts: &[String]) -> Result<Vec<EmbeddingVector>> {
+        self.embedder.embed_batch(texts).await
+    }
+
+    pub async fn search(
+        &self,
+        collection: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchResult>> {
+        debug!(collection, query_len = query.len(), limit, "searching");
+        let query_embedding = self.embed(query).await?;
+        let hits = self
+            .vector_store
+            .search(collection, &query_embedding.vector, limit)
+            .await?;
+
+        Ok(hits
+            .into_iter()
+            .map(|hit| SearchResult {
+                chunk: CodeChunk {
+                    id: hit.id,
+                    content: hit.content,
+                    file_path: hit.metadata.file_path,
+                    relative_path: hit.metadata.relative_path,
+                    start_line: hit.metadata.start_line,
+                    end_line: hit.metadata.end_line,
+                    language: hit.metadata.language,
+                },
+                score: hit.score,
+            })
+            .collect())
+    }
+
+    pub async fn ensure_collection(&self, path: &Path) -> Result<String> {
+        debug!(path = %path.display(), "ensuring collection exists");
+        let collection_name = crate::vectordb::collection_name_from_path(path);
+
+        if !self.vector_store.has_collection(&collection_name).await? {
+            let dimension = self.config.embedding_dimension;
+            self.vector_store
+                .create_collection(&collection_name, dimension)
+                .await?;
+        }
+
+        Ok(collection_name)
+    }
+
+    pub async fn delete_collection(&self, path: &Path) -> Result<()> {
+        info!(path = %path.display(), "deleting collection");
+        let collection_name = crate::vectordb::collection_name_from_path(path);
+        self.vector_store.drop_collection(&collection_name).await
+    }
+
+    pub fn split_file(&self, path: &Path) -> Result<Vec<CodeChunk>> {
+        self.splitter.split_file(path)
+    }
+
+    pub fn split_files(&self, paths: &[PathBuf]) -> Result<Vec<CodeChunk>> {
+        self.splitter.split_files(paths)
+    }
+}
+
+/// Thread-safe shared state handle.
+pub type SharedState = Arc<ContextState>;
+
+pub fn create_shared_state(config: Config) -> SharedState {
+    Arc::new(ContextState::new(config))
+}
+
+pub fn create_shared_state_with_components(
+    config: Config,
+    embedder: Embedder,
+    vector_store: VectorStore,
+) -> SharedState {
+    Arc::new(ContextState::with_components(
+        config,
+        embedder,
+        vector_store,
+    ))
+}
+
+pub fn create_default_shared_state() -> SharedState {
+    Arc::new(ContextState::with_defaults())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_index_status_default() {
+        let status = IndexStatus::default();
+        assert_eq!(status.total_files, 0);
+        assert_eq!(status.processed_files, 0);
+        assert_eq!(status.total_chunks, 0);
+        assert_eq!(status.status, IndexState::Idle);
+    }
+
+    #[test]
+    fn test_context_state_uses_config_to_enable_backends() {
+        let state = ContextState::new(Config {
+            embedding_url: "https://api.jina.ai/v1".to_string(),
+            ..Config::default()
+        });
+
+        assert!(state.embedder.is_enabled());
+    }
+
+    #[test]
+    fn test_get_status_prefers_persisted_non_idle_over_stale_idle() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().to_path_buf();
+        let state = ContextState::with_components(
+            Config::default(),
+            Embedder::Disabled,
+            VectorStore::new(),
+        );
+
+        state.set_status(path.clone(), IndexStatus::default());
+        state
+            .manifest_store
+            .write_status(
+                &path,
+                &IndexStatus {
+                    total_files: 3,
+                    processed_files: 2,
+                    total_chunks: 11,
+                    embeddings_generated: 7,
+                    vectors_inserted: 7,
+                    status: IndexState::Failed,
+                },
+            )
+            .unwrap();
+
+        let status = state.get_status(&path);
+
+        assert_eq!(status.status, IndexState::Failed);
+        assert_eq!(status.total_files, 3);
+        assert_eq!(status.vectors_inserted, 7);
+    }
+}
