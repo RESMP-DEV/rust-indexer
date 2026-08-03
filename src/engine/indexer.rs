@@ -168,12 +168,23 @@ async fn run_index_codebase(
             .as_ref()
             .map(|status| status.vectors_inserted > 0)
             .unwrap_or(false);
-        if has_semantic || status_reports_vectors {
+        // The authenticated provenance record is semantic evidence in its
+        // own right: a collection built from an empty repository holds zero
+        // vectors, yet advancing the shared manifest past it lexically would
+        // let the sibling skip populating it forever.
+        let recorded_backend = state
+            .manifest_store
+            .load_backend(path)
+            .ok()
+            .flatten()
+            .is_some();
+        if has_semantic || status_reports_vectors || recorded_backend {
             refuse_before_mutation(state, path, previous_status_before_index.as_ref()).await;
             anyhow::bail!(
-                "A semantic index exists for {} (collection {} or a recorded vector count) but \
-                 embeddings are disabled; set EMBEDDING_URL (and MILVUS_URL if the vectors live \
-                 in Milvus) to keep it current, or clear the index before lexical-only indexing",
+                "A semantic index exists for {} (collection {}, a recorded vector count, or a \
+                 backend provenance record) but embeddings are disabled; set EMBEDDING_URL (and \
+                 MILVUS_URL if the vectors live in Milvus) to keep it current, or clear the \
+                 index before lexical-only indexing",
                 path.display(),
                 collection_name
             );
@@ -2186,6 +2197,44 @@ mod tests {
         ManifestStore.clear_backend(root).unwrap();
         api.clear(root).await.unwrap();
         assert!(ManifestStore.load(root).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_lexical_only_indexing_refuses_provenance_record() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let cache_dir = TempDir::new().unwrap();
+        let _cache_lock = set_test_cache_dir_async(cache_dir.path()).await;
+        fs::write(root.join("main.py"), "def add(a, b):\n    return a + b\n").unwrap();
+
+        // Zero recorded vectors and no visible collection, but an
+        // authenticated provenance record: still semantic state.
+        ManifestStore
+            .write_for_files(
+                root,
+                "collection",
+                &IndexInputs {
+                    chunk_size: 512,
+                    overlap_lines: 3,
+                    min_chunk_lines: 5,
+                    target_chunk_lines: 50,
+                    extensions: vec!["py".into()],
+                    ignore_patterns: vec![],
+                    max_file_size: 1024 * 1024,
+                    follow_symlinks: false,
+                    embedding_passage_prefix_sha256: String::new(),
+                },
+                &[root.join("main.py")],
+            )
+            .unwrap();
+        ManifestStore
+            .write_backend(root, "milvus http://elsewhere:19530")
+            .unwrap();
+
+        let state = make_lexical_indexer_state(root);
+        let err = index_codebase(&state, root, false).await.unwrap_err();
+        assert!(err.to_string().contains("embeddings are disabled"));
+        assert_eq!(state.get_status().await.status, IndexState::Failed);
     }
 
     #[tokio::test]

@@ -74,4 +74,6 @@
   retrieval with a warning instead of fusing stale vectors, while lexical
   results continue to serve, and `clear` refuses an authenticated backend
   mismatch regardless of the recorded vector count, so even an empty
-  remote collection must be dropped by the backend that owns it.
+  remote collection must be dropped by the backend that owns it. The
+  lexical-only guard likewise treats an authenticated provenance record as
+  semantic evidence, covering collections that hold zero vectors.
