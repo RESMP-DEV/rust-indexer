@@ -376,6 +376,7 @@ impl Indexer {
             .manifest_store
             .clear_manifest(path)
             .context("failed to remove index manifest")?;
+        let _ = self.state.manifest_store.clear_backend(path);
         self.state.indexing_status.remove(&path.to_path_buf());
 
         let lexical_path = path.to_path_buf();

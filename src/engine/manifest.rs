@@ -188,6 +188,50 @@ impl ManifestStore {
         Ok(())
     }
 
+    pub fn load_backend(&self, path: &Path) -> Result<Option<String>> {
+        let backend_path = backend_path(path);
+        if !backend_path.exists() {
+            return Ok(None);
+        }
+        let contents = fs::read_to_string(&backend_path)
+            .with_context(|| format!("failed to read backend record {}", backend_path.display()))?;
+        let record: BackendRecord = serde_json::from_str(&contents).with_context(|| {
+            format!("failed to parse backend record {}", backend_path.display())
+        })?;
+        Ok(Some(record.backend))
+    }
+
+    pub fn write_backend(&self, path: &Path, backend: &str) -> Result<()> {
+        let backend_path = backend_path(path);
+        if let Some(parent) = backend_path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed to create backend record directory {}",
+                    parent.display()
+                )
+            })?;
+        }
+        let json = serde_json::to_string_pretty(&BackendRecord {
+            backend: backend.to_string(),
+        })
+        .context("failed to serialize backend record")?;
+        fs::write(&backend_path, json).with_context(|| {
+            format!("failed to write backend record {}", backend_path.display())
+        })?;
+        Ok(())
+    }
+
+    pub fn clear_backend(&self, path: &Path) -> Result<()> {
+        let backend_path = backend_path(path);
+        if !backend_path.exists() {
+            return Ok(());
+        }
+        fs::remove_file(&backend_path).with_context(|| {
+            format!("failed to remove backend record {}", backend_path.display())
+        })?;
+        Ok(())
+    }
+
     pub fn clear_manifest(&self, path: &Path) -> Result<()> {
         let manifest_path = manifest_path(path);
         if !manifest_path.exists() {
@@ -274,6 +318,18 @@ pub fn fingerprint_files(root: &Path, files: &[PathBuf]) -> Result<Vec<FileFinge
     let mut fingerprints = results.into_iter().collect::<Result<Vec<_>>>()?;
     fingerprints.sort_unstable_by(|a, b| a.relative_path.cmp(&b.relative_path));
     Ok(fingerprints)
+}
+
+/// Which vector backend produced the recorded index. This sidecar is owned
+/// by rust-indexer alone (rust_sindexer ignores unknown files in .sindexer/),
+/// so it adds provenance without changing the shared manifest schema.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BackendRecord {
+    backend: String,
+}
+
+fn backend_path(root: &Path) -> PathBuf {
+    root.join(".sindexer").join("vector-backend.json")
 }
 
 fn manifest_path(root: &Path) -> PathBuf {

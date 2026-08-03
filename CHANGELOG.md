@@ -55,4 +55,9 @@
   semantic results as current. Mid-run failures preserve the prior
   recorded vector counts unless the run dropped the collection, and the
   local backend must hold at least the recorded row count before clear
-  treats the evidence as visible.
+  treats the evidence as visible. Embeddings-enabled runs record backend
+  provenance in `.sindexer/vector-backend.json` (a rust-indexer-owned
+  sidecar that does not change the shared manifest schema); a backend
+  switch forces a full rebuild on `index` and refuses `update`, so a
+  same-named collection in a previously used backend cannot satisfy an
+  empty manifest diff with stale vectors.

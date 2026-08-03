@@ -40,6 +40,15 @@ impl VectorStore {
         }
     }
 
+    /// Stable identity of the backend holding the vectors, recorded next to
+    /// the shared manifest so a backend switch forces revalidation.
+    pub fn provenance(&self) -> String {
+        match self {
+            Self::Local(_) => "local".to_string(),
+            Self::Milvus(client) => format!("milvus {}", client.base_url()),
+        }
+    }
+
     pub async fn create_collection(&self, name: &str, dimension: usize) -> Result<()> {
         info!(collection = name, dimension, "creating collection");
         match self {

@@ -234,6 +234,40 @@ async fn run_index_codebase(
 
                 cached_fingerprints = Some(fingerprints);
 
+                // A compatible manifest is only trustworthy if the vectors
+                // it describes live in the currently configured backend.
+                // Same-named collections can exist in both stores (e.g.
+                // after switching MILVUS_URL), so an empty diff against the
+                // wrong backend would serve stale vectors as current.
+                if embeddings_enabled {
+                    let current_backend = state.vector_store.provenance();
+                    match state.manifest_store.load_backend(path) {
+                        Ok(Some(recorded)) if recorded != current_backend => {
+                            if incremental_only {
+                                refuse_before_mutation(
+                                    state,
+                                    path,
+                                    previous_status_before_index.as_ref(),
+                                )
+                                .await;
+                                anyhow::bail!(
+                                    "The recorded index was built against vector backend '{}' but the \
+                                     current backend is '{}'; run index --force to rebuild",
+                                    recorded,
+                                    current_backend
+                                );
+                            }
+                            warn!(
+                                recorded_backend = %recorded,
+                                current_backend = %current_backend,
+                                "Vector backend changed since the last index; forcing a full rebuild"
+                            );
+                            full_reindex = true;
+                        }
+                        _ => {}
+                    }
+                }
+
                 let has_collection = if embeddings_enabled {
                     match state.vector_store.has_collection(&collection_name).await {
                         Ok(has) => has,
@@ -426,6 +460,11 @@ async fn run_index_codebase(
         } else {
             0
         };
+        if embeddings_enabled {
+            let _ = state
+                .manifest_store
+                .write_backend(path, &state.vector_store.provenance());
+        }
         {
             let mut status = state.indexing_status.write().await;
             status.total_files = total_files;
@@ -724,6 +763,11 @@ async fn run_index_codebase(
         return Err(e).context("Failed to write index manifest");
     }
 
+    if embeddings_enabled {
+        let _ = state
+            .manifest_store
+            .write_backend(path, &state.vector_store.provenance());
+    }
     {
         let mut status = state.indexing_status.write().await;
         status.total_files = total_files;
@@ -1898,6 +1942,76 @@ mod tests {
         embedding.wait().await;
         dead_embedding.wait().await;
         milvus.wait().await;
+    }
+
+    #[tokio::test]
+    async fn test_backend_switch_forces_rebuild_and_blocks_incremental() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let cache_dir = TempDir::new().unwrap();
+        let _cache_lock = set_test_cache_dir_async(cache_dir.path()).await;
+        fs::write(root.join("main.py"), "def add(a, b):\n    return a + b\n").unwrap();
+
+        let embedding = spawn_dynamic_mock_embedding_server().await;
+        let make_local_state = || {
+            IndexerState::new(
+                CodeWalker::new(),
+                CodeSplitter::new(SplitterConfig {
+                    root_path: root.to_path_buf(),
+                    max_chunk_bytes: Config::default().chunk_size,
+                    overlap_lines: Config::default().chunk_overlap / 80,
+                    ..SplitterConfig::default()
+                }),
+                Embedder::Http(EmbeddingClient::new(EmbeddingConfig {
+                    url: format!("{}/v1/embeddings", embedding.base_url),
+                    model: "test".to_string(),
+                    batch_size: 100,
+                    api_key: None,
+                    query_prefix: String::new(),
+                    passage_prefix: String::new(),
+                })),
+                VectorStore::Local(crate::vectordb::LocalStore::new()),
+                4,
+            )
+        };
+
+        // Build against the local backend; provenance is recorded.
+        let first = index_codebase(&make_local_state(), root, false)
+            .await
+            .unwrap();
+        assert!(first.vectors_inserted > 0);
+        assert_eq!(
+            ManifestStore.load_backend(root).unwrap().as_deref(),
+            Some("local")
+        );
+
+        // Simulate the index having been produced by a different backend.
+        ManifestStore
+            .write_backend(root, "milvus http://elsewhere:19530")
+            .unwrap();
+
+        // Incremental update refuses the mismatch outright.
+        let err = update_codebase_index(&make_local_state(), root)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("vector backend"));
+
+        // A plain index run forces a full rebuild instead of reporting
+        // "already up to date" against the wrong backend's vectors.
+        let rebuilt = index_codebase(&make_local_state(), root, false)
+            .await
+            .unwrap();
+        assert!(rebuilt.chunks_created > 0);
+        assert!(!rebuilt
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("already up to date")));
+        assert_eq!(
+            ManifestStore.load_backend(root).unwrap().as_deref(),
+            Some("local")
+        );
+
+        embedding.wait().await;
     }
 
     #[tokio::test]

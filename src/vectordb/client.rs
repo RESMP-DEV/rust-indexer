@@ -226,6 +226,11 @@ impl MilvusClient {
         }
     }
 
+    /// Base URL this client talks to (used for backend provenance).
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     /// Create a collection with the specified name and vector dimension.
     ///
     /// Uses cosine similarity as the metric type. The collection will have:
