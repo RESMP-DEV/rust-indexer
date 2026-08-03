@@ -18,6 +18,18 @@ use crate::config::Config;
 const COLLECTION_IDENTITY_ENV: &str = "SINDEXER_COLLECTION_IDENTITY";
 const COLLECTION_ROOT_ENV: &str = "SINDEXER_COLLECTION_ROOT";
 
+/// Collection scoping resolved once per process. Reading the environment on
+/// every call would let a runtime mutation silently retarget collections
+/// mid-process; freezing at first use keeps naming deterministic for the
+/// process lifetime, which is the semantics a short-lived CLI wants.
+static COLLECTION_SCOPE: once_cell::sync::Lazy<(Option<String>, Option<String>)> =
+    once_cell::sync::Lazy::new(|| {
+        (
+            env::var(COLLECTION_IDENTITY_ENV).ok(),
+            env::var(COLLECTION_ROOT_ENV).ok(),
+        )
+    });
+
 /// Selects between the local brute-force vector store and a remote
 /// Milvus/Zilliz instance. Collection naming and stored metadata match
 /// rust_sindexer, so both tools can operate on the same index.
@@ -211,8 +223,7 @@ fn build_relative_path_milvus_filter(relative_paths: &[String]) -> String {
 /// their path relative to the configured root so separate projects cannot
 /// alias the root collection or one another.
 pub fn collection_name_from_path(path: &Path) -> String {
-    let identity = env::var(COLLECTION_IDENTITY_ENV).ok();
-    let root = env::var(COLLECTION_ROOT_ENV).ok();
+    let (identity, root) = &*COLLECTION_SCOPE;
     let identity = scoped_collection_identity(path, identity.as_deref(), root.as_deref());
     collection_name_from_path_with_identity(path, identity.as_deref())
 }
