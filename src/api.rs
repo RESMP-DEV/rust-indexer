@@ -304,6 +304,13 @@ impl Indexer {
         self.state
             .set_status(path.to_path_buf(), IndexStatus::default());
         let _ = self.state.manifest_store.clear_status(path);
+        // The manifest must go with the lexical index: a surviving manifest
+        // makes the next index/update report "already up to date" against an
+        // empty index.
+        self.state
+            .manifest_store
+            .clear_manifest(path)
+            .context("failed to remove index manifest")?;
         self.state.indexing_status.remove(&path.to_path_buf());
 
         let lexical_path = path.to_path_buf();

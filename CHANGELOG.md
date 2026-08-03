@@ -31,4 +31,7 @@
   fast when the lexical cache is missing instead of creating a fresh one;
   search results rebuild `file_path` from the local checkout root so
   identity-scoped collections shared across hosts resolve to local files;
-  the unused Milvus `Document`/`insert` API was removed.
+  the unused Milvus `Document`/`insert` API was removed; and `clear` now
+  deletes the index manifest along with the lexical index so the next
+  `index`/`update` rebuilds instead of reporting "already up to date"
+  against an empty index.

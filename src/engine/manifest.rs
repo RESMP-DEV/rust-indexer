@@ -187,6 +187,17 @@ impl ManifestStore {
             .with_context(|| format!("failed to remove status {}", status_path.display()))?;
         Ok(())
     }
+
+    pub fn clear_manifest(&self, path: &Path) -> Result<()> {
+        let manifest_path = manifest_path(path);
+        if !manifest_path.exists() {
+            return Ok(());
+        }
+
+        fs::remove_file(&manifest_path)
+            .with_context(|| format!("failed to remove manifest {}", manifest_path.display()))?;
+        Ok(())
+    }
 }
 
 pub fn diff_manifest_against_files(
@@ -429,5 +440,36 @@ mod tests {
 
         store.clear_status(root).unwrap();
         assert!(store.load_status(root).unwrap().is_none());
+    }
+
+    #[test]
+    fn clear_manifest_removes_manifest_file() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        let src = root.join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("lib.rs"), "fn main() {}\n").unwrap();
+
+        let inputs = IndexInputs {
+            chunk_size: 512,
+            overlap_lines: 3,
+            min_chunk_lines: 5,
+            target_chunk_lines: 50,
+            extensions: vec!["rs".into()],
+            ignore_patterns: vec!["target".into()],
+            max_file_size: 1024 * 1024,
+            follow_symlinks: false,
+            embedding_passage_prefix_sha256: String::new(),
+        };
+        let store = ManifestStore;
+        store
+            .write_for_files(root, "collection", &inputs, &[src.join("lib.rs")])
+            .unwrap();
+        assert!(store.load(root).unwrap().is_some());
+
+        store.clear_manifest(root).unwrap();
+        assert!(store.load(root).unwrap().is_none());
+        // Idempotent on a missing manifest.
+        store.clear_manifest(root).unwrap();
     }
 }
