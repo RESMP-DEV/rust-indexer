@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Fix: parse `upsertCount` from Milvus upsert responses (the endpoint switch
+  to upsert left the client reading only `insertCount`, so every accepted
+  batch counted as zero vectors and indexing aborted).
+
 - Initial fork from rust_sindexer (MCP server variant) as a standalone CLI
   with clap subcommands `index`, `update`, `search`, `status`, `clear`, and
   `collections`, each supporting `--json` output. The MCP protocol surface

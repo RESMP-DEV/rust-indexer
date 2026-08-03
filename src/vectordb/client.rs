@@ -141,7 +141,10 @@ struct InsertResponse {
 
 #[derive(Deserialize)]
 struct InsertResponseData {
-    #[serde(rename = "insertCount", default)]
+    // The upsert endpoint reports `upsertCount`; older insert responses used
+    // `insertCount`. Accept both or a real accepted count reads as zero and
+    // the pipeline aborts with "inserted 0 vectors".
+    #[serde(rename = "insertCount", alias = "upsertCount", default)]
     insert_count: usize,
 }
 
@@ -662,6 +665,23 @@ impl SearchResultsData {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn insert_response_accepts_upsert_count() {
+        let response: super::InsertResponse = serde_json::from_value(serde_json::json!({
+            "code": 0,
+            "data": {"upsertCount": 5}
+        }))
+        .unwrap();
+        assert_eq!(response.data.unwrap().insert_count, 5);
+
+        let response: super::InsertResponse = serde_json::from_value(serde_json::json!({
+            "code": 0,
+            "data": {"insertCount": 3}
+        }))
+        .unwrap();
+        assert_eq!(response.data.unwrap().insert_count, 3);
+    }
+
     #[test]
     fn search_response_accepts_nested_results() {
         let response: super::SearchResponse = serde_json::from_value(serde_json::json!({
