@@ -111,7 +111,18 @@ async fn run_index_codebase(
     let start = Instant::now();
     let mut warnings = Vec::new();
     let embeddings_enabled = state.embedder.is_enabled();
-    let previous_status_before_index = state.manifest_store.load_status(path).ok().flatten();
+    // A malformed or unreadable status file is not "no evidence": it may
+    // hold the recorded vector count the lexical-only guard depends on.
+    // Fail in memory and leave the file untouched for inspection.
+    let previous_status_before_index = match state.manifest_store.load_status(path) {
+        Ok(status) => status,
+        Err(e) => {
+            let mut status = state.indexing_status.write().await;
+            status.status = IndexState::Failed;
+            drop(status);
+            return Err(e).context("Failed to read the persisted index status");
+        }
+    };
 
     {
         let status = state.indexing_status.read().await;
@@ -135,7 +146,90 @@ async fn run_index_codebase(
 
     info!("Starting codebase indexing at {}", path.display());
 
+    if incremental_only
+        && state.manifest_store.load(path).ok().flatten().is_some()
+        && !LexicalIndex::exists(path).unwrap_or(false)
+    {
+        refuse_before_mutation(state, path, previous_status_before_index.as_ref()).await;
+        anyhow::bail!(
+            "Incremental update requires an existing lexical index for {}; run index --force to rebuild",
+            path.display()
+        );
+    }
+
     let collection_name = collection_name_from_path(path);
+
+    // A lexical-only run over a path with a live semantic collection would
+    // refresh the shared manifest without touching the vectors, making a
+    // later embeddings-enabled run (here or in rust_sindexer) see an empty
+    // diff and keep stale semantic results forever. Refuse instead.
+    if !embeddings_enabled {
+        let has_semantic = match state.vector_store.has_collection(&collection_name).await {
+            Ok(has) => has,
+            Err(e) => {
+                refuse_before_mutation(state, path, previous_status_before_index.as_ref()).await;
+                return Err(e).context("Failed to check for an existing vector collection");
+            }
+        };
+        // The configured backend may not be the one holding the semantic
+        // index (e.g. MILVUS_URL unset outside the wrapper environment), so
+        // also consult the shared status file both tools persist: a recorded
+        // vector count is evidence of semantic state we cannot see.
+        let status_reports_vectors = previous_status_before_index
+            .as_ref()
+            .map(|status| status.vectors_inserted > 0)
+            .unwrap_or(false);
+        // The authenticated provenance record is semantic evidence in its
+        // own right: a collection built from an empty repository holds zero
+        // vectors, yet advancing the shared manifest past it lexically would
+        // let the sibling skip populating it forever.
+        let recorded_backend = match state.manifest_store.load_backend(path) {
+            Ok(record) => record.is_some(),
+            Err(e) => {
+                refuse_before_mutation(state, path, previous_status_before_index.as_ref()).await;
+                return Err(e).context("Failed to read backend provenance record");
+            }
+        };
+        if has_semantic || status_reports_vectors || recorded_backend {
+            refuse_before_mutation(state, path, previous_status_before_index.as_ref()).await;
+            anyhow::bail!(
+                "A semantic index exists for {} (collection {}, a recorded vector count, or a \
+                 backend provenance record) but embeddings are disabled; set EMBEDDING_URL (and \
+                 MILVUS_URL if the vectors live in Milvus) to keep it current, or clear the \
+                 index before lexical-only indexing",
+                path.display(),
+                collection_name
+            );
+        }
+    }
+
+    // A backend switch is never resolved by rebuilding here, forced or not:
+    // rebuilding advances the shared manifest while the collection in the
+    // recorded backend survives, and rust_sindexer reconnecting to that
+    // backend would then serve its stale vectors as current. Re-homing goes
+    // through `clear` with the recorded backend configured, which actually
+    // drops the old collection along with the record.
+    if embeddings_enabled {
+        let current_backend = state.vector_store.provenance();
+        match state.manifest_store.load_backend(path) {
+            Ok(Some(recorded)) if recorded != current_backend => {
+                refuse_before_mutation(state, path, previous_status_before_index.as_ref()).await;
+                anyhow::bail!(
+                    "The recorded index was built against vector backend '{}' but the current \
+                     backend is '{}'; configure the recorded backend and run clear to retire its \
+                     collection before re-indexing here",
+                    recorded,
+                    current_backend
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                refuse_before_mutation(state, path, previous_status_before_index.as_ref()).await;
+                return Err(e).context("Failed to read backend provenance record");
+            }
+        }
+    }
+
     let index_inputs = IndexInputs::from_splitter_and_walker(
         state.splitter.config(),
         &state.walker.extensions,
@@ -143,13 +237,14 @@ async fn run_index_codebase(
         state.walker.max_file_size,
         state.walker.follow_symlinks,
         state.embedder.passage_prefix(),
+        state.embedding_dimension,
     );
 
     // Phase 1: Walk files
     let files = match state.walker.walk(path).await {
         Ok(files) => files,
         Err(e) => {
-            update_status_failed(state, path).await;
+            refuse_before_mutation(state, path, previous_status_before_index.as_ref()).await;
             return Err(e).context("Failed to walk codebase");
         }
     };
@@ -160,7 +255,7 @@ async fn run_index_codebase(
     let previous_manifest = match state.manifest_store.load(path) {
         Ok(previous) => previous,
         Err(e) => {
-            update_status_failed(state, path).await;
+            refuse_before_mutation(state, path, previous_status_before_index.as_ref()).await;
             return Err(e).context("Failed to load index manifest");
         }
     };
@@ -182,18 +277,34 @@ async fn run_index_codebase(
                 ) {
                     Ok(result) => result,
                     Err(e) => {
-                        update_status_failed(state, path).await;
+                        refuse_before_mutation(state, path, previous_status_before_index.as_ref())
+                            .await;
                         return Err(e).context("Failed to diff index manifest");
                     }
                 };
 
                 cached_fingerprints = Some(fingerprints);
 
-                if embeddings_enabled
-                    && !state.vector_store.has_collection(&collection_name).await?
-                {
+                let has_collection = if embeddings_enabled {
+                    match state.vector_store.has_collection(&collection_name).await {
+                        Ok(has) => has,
+                        Err(e) => {
+                            refuse_before_mutation(
+                                state,
+                                path,
+                                previous_status_before_index.as_ref(),
+                            )
+                            .await;
+                            return Err(e).context("Failed to check vector collection existence");
+                        }
+                    }
+                } else {
+                    true
+                };
+                if embeddings_enabled && !has_collection {
                     if incremental_only {
-                        update_status_failed(state, path).await;
+                        refuse_before_mutation(state, path, previous_status_before_index.as_ref())
+                            .await;
                         anyhow::bail!(
                             "Incremental update requires existing vector collection {}; run index_codebase only when a full rebuild is intended",
                             collection_name
@@ -227,6 +338,15 @@ async fn run_index_codebase(
                         vectors_inserted,
                     )
                     .await;
+                    if embeddings_enabled {
+                        record_backend_or_rollback(
+                            state,
+                            path,
+                            previous_status_before_index.as_ref(),
+                            false,
+                        )
+                        .await?;
+                    }
                     return Ok(IndexResult {
                         files_processed: 0,
                         chunks_created: 0,
@@ -263,7 +383,8 @@ async fn run_index_codebase(
             }
             Some(_) => {
                 if incremental_only {
-                    update_status_failed(state, path).await;
+                    refuse_before_mutation(state, path, previous_status_before_index.as_ref())
+                        .await;
                     anyhow::bail!(
                         "Incremental update requires a compatible index manifest; run index_codebase only when a full rebuild is intended"
                     );
@@ -272,7 +393,8 @@ async fn run_index_codebase(
             }
             None => {
                 if incremental_only {
-                    update_status_failed(state, path).await;
+                    refuse_before_mutation(state, path, previous_status_before_index.as_ref())
+                        .await;
                     anyhow::bail!(
                         "Incremental update requires an existing index manifest; run index_codebase first only when a full build is intended"
                     );
@@ -284,13 +406,31 @@ async fn run_index_codebase(
 
     if embeddings_enabled {
         if let Err(e) = prepare_vector_index(state, &collection_name, full_reindex).await {
-            update_status_failed(state, path).await;
+            update_status_failed(
+                state,
+                path,
+                if full_reindex {
+                    None
+                } else {
+                    previous_status_before_index.as_ref()
+                },
+            )
+            .await;
             return Err(e).context("Failed to prepare vector collection");
         }
     }
 
     if let Err(e) = prepare_lexical_index(path, &stale_relative_paths, full_reindex).await {
-        update_status_failed(state, path).await;
+        update_status_failed(
+            state,
+            path,
+            if full_reindex {
+                None
+            } else {
+                previous_status_before_index.as_ref()
+            },
+        )
+        .await;
         return Err(e).context("Failed to prepare lexical index");
     }
 
@@ -300,7 +440,16 @@ async fn run_index_codebase(
             .delete_by_relative_paths(&collection_name, &stale_relative_paths)
             .await
         {
-            update_status_failed(state, path).await;
+            update_status_failed(
+                state,
+                path,
+                if full_reindex {
+                    None
+                } else {
+                    previous_status_before_index.as_ref()
+                },
+            )
+            .await;
             return Err(e).context("Failed to delete stale vectors");
         }
     }
@@ -319,7 +468,16 @@ async fn run_index_codebase(
             &files,
             cached_fingerprints.take(),
         ) {
-            update_status_failed(state, path).await;
+            update_status_failed(
+                state,
+                path,
+                if full_reindex {
+                    None
+                } else {
+                    previous_status_before_index.as_ref()
+                },
+            )
+            .await;
             return Err(e).context("Failed to write index manifest");
         }
 
@@ -328,6 +486,15 @@ async fn run_index_codebase(
         } else {
             0
         };
+        if embeddings_enabled {
+            record_backend_or_rollback(
+                state,
+                path,
+                failure_evidence(full_reindex, previous_status_before_index.as_ref()),
+                true,
+            )
+            .await?;
+        }
         {
             let mut status = state.indexing_status.write().await;
             status.total_files = total_files;
@@ -547,14 +714,32 @@ async fn run_index_codebase(
         .context("Lexical index task panicked")
         .and_then(|r| r)
     {
-        update_status_failed(state, path).await;
+        update_status_failed(
+            state,
+            path,
+            if full_reindex {
+                None
+            } else {
+                previous_status_before_index.as_ref()
+            },
+        )
+        .await;
         return Err(e).context("Failed to update lexical index");
     }
 
     let (embeddings_generated, vectors_inserted, mut embedding_warnings) = match embedding_result {
         Ok(counts) => counts,
         Err(e) => {
-            update_status_failed(state, path).await;
+            update_status_failed(
+                state,
+                path,
+                if full_reindex {
+                    None
+                } else {
+                    previous_status_before_index.as_ref()
+                },
+            )
+            .await;
             return Err(e);
         }
     };
@@ -595,10 +780,28 @@ async fn run_index_codebase(
         &files,
         cached_fingerprints.take(),
     ) {
-        update_status_failed(state, path).await;
+        update_status_failed(
+            state,
+            path,
+            if full_reindex {
+                None
+            } else {
+                previous_status_before_index.as_ref()
+            },
+        )
+        .await;
         return Err(e).context("Failed to write index manifest");
     }
 
+    if embeddings_enabled {
+        record_backend_or_rollback(
+            state,
+            path,
+            failure_evidence(full_reindex, previous_status_before_index.as_ref()),
+            true,
+        )
+        .await?;
+    }
     {
         let mut status = state.indexing_status.write().await;
         status.total_files = total_files;
@@ -735,10 +938,85 @@ fn split_or_skip_embedding_batch(
     pending.push(batch);
 }
 
-async fn update_status_failed(state: &IndexerState, path: &Path) {
+/// Persist the backend provenance record; on failure, roll back so no
+/// unauthenticated state survives. The record write is atomic (temp +
+/// rename), so a failure leaves any previously valid record intact; when
+/// this run just rewrote the manifest, the manifest is rolled back (a
+/// missing manifest forces full revalidation next run, which is safe; a
+/// new manifest without an authenticating record would let a stale
+/// same-named backend be adopted as current).
+async fn record_backend_or_rollback(
+    state: &IndexerState,
+    path: &Path,
+    prior_evidence: Option<&IndexStatus>,
+    manifest_written_this_run: bool,
+) -> Result<()> {
+    if let Err(e) = state
+        .manifest_store
+        .write_backend(path, &state.vector_store.provenance())
+    {
+        if manifest_written_this_run {
+            let _ = state.manifest_store.clear_manifest(path);
+        }
+        update_status_failed(state, path, prior_evidence).await;
+        return Err(e).context("Failed to record vector backend provenance");
+    }
+    Ok(())
+}
+
+/// Evidence to preserve on failure: the pre-run status, unless this run
+/// dropped the collection (full reindex), in which case partial counts are
+/// the truth.
+fn failure_evidence(full_reindex: bool, previous: Option<&IndexStatus>) -> Option<&IndexStatus> {
+    if full_reindex {
+        None
+    } else {
+        previous
+    }
+}
+
+/// Persist a Failed status for a run that failed after mutations began.
+/// `prior_evidence` (the pre-run status, None when this run dropped the
+/// collection) keeps the durable vector counts from being zeroed by an
+/// early failure: remote vectors still exist, and the lexical-only guard
+/// depends on the recorded count to know that.
+async fn update_status_failed(
+    state: &IndexerState,
+    path: &Path,
+    prior_evidence: Option<&IndexStatus>,
+) {
     let mut status = state.indexing_status.write().await;
     status.status = IndexState::Failed;
+    if let Some(previous) = prior_evidence {
+        status.vectors_inserted = status.vectors_inserted.max(previous.vectors_inserted);
+        status.embeddings_generated = status
+            .embeddings_generated
+            .max(previous.embeddings_generated);
+    }
     let _ = state.manifest_store.write_status(path, &status);
+}
+
+/// Fail a run that was refused before mutating any index state. The failure
+/// is recorded in memory, but the persisted status is restored to its
+/// pre-run value: a zeroed Failed status would destroy durable evidence
+/// (such as a recorded vector count) that later runs depend on.
+async fn refuse_before_mutation(
+    state: &IndexerState,
+    path: &Path,
+    previous_status: Option<&IndexStatus>,
+) {
+    {
+        let mut status = state.indexing_status.write().await;
+        status.status = IndexState::Failed;
+    }
+    match previous_status {
+        Some(previous) => {
+            let _ = state.manifest_store.write_status(path, previous);
+        }
+        None => {
+            let _ = state.manifest_store.clear_status(path);
+        }
+    }
 }
 
 async fn update_status_completed_counts(
@@ -1145,15 +1423,18 @@ mod tests {
                 overlap_lines: Config::default().chunk_overlap / 80,
                 ..SplitterConfig::default()
             }),
-            Embedder::Http(EmbeddingClient::new(EmbeddingConfig {
-                url: format!("{}/v1/embeddings", embedding_url),
-                model: "test".to_string(),
-                batch_size: 100,
-                api_key: None,
-                query_prefix: String::new(),
-                passage_prefix: String::new(),
-            })),
-            VectorStore::new(),
+            Embedder::Http(
+                EmbeddingClient::new(EmbeddingConfig {
+                    url: format!("{}/v1/embeddings", embedding_url),
+                    model: "test".to_string(),
+                    batch_size: 100,
+                    api_key: None,
+                    query_prefix: String::new(),
+                    passage_prefix: String::new(),
+                })
+                .unwrap(),
+            ),
+            VectorStore::Local(crate::vectordb::LocalStore::new()),
             dimension,
         )
     }
@@ -1168,7 +1449,7 @@ mod tests {
                 ..SplitterConfig::default()
             }),
             Embedder::Disabled,
-            VectorStore::new(),
+            VectorStore::Local(crate::vectordb::LocalStore::new()),
             384,
         )
     }
@@ -1187,6 +1468,28 @@ mod tests {
         assert!(err
             .to_string()
             .contains("Incremental update requires an existing index manifest"));
+        assert_eq!(state.get_status().await.status, IndexState::Failed);
+    }
+
+    #[tokio::test]
+    async fn test_incremental_update_requires_existing_lexical_index() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let cache_dir = TempDir::new().unwrap();
+        let _cache_lock = set_test_cache_dir_async(cache_dir.path()).await;
+        fs::write(root.join("main.py"), "def add(a, b):\n    return a + b\n").unwrap();
+
+        let state = make_lexical_indexer_state(root);
+        index_codebase(&state, root, false).await.unwrap();
+
+        // Simulate a lost lexical cache (manifest still present in the repo).
+        let other_cache = TempDir::new().unwrap();
+        std::env::set_var("XDG_CACHE_HOME", other_cache.path());
+
+        let err = update_codebase_index(&state, root).await.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Incremental update requires an existing lexical index"));
         assert_eq!(state.get_status().await.status, IndexState::Failed);
     }
 
@@ -1270,7 +1573,7 @@ mod tests {
         let first_result = index_codebase(&state, root, false).await.unwrap();
         assert!(first_result.files_processed >= 2);
 
-        let manifest_path = root.join(".rust-indexer").join("index-manifest.json");
+        let manifest_path = root.join(".sindexer").join("index-manifest.json");
         assert!(manifest_path.exists());
 
         let second_result = index_codebase(&state, root, false).await.unwrap();
@@ -1361,6 +1664,715 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_index_surfaces_vector_backend_errors_instead_of_hanging() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let cache_dir = TempDir::new().unwrap();
+        let _cache_lock = set_test_cache_dir_async(cache_dir.path()).await;
+        fs::write(root.join("main.py"), "def add(a, b):\n    return a + b\n").unwrap();
+
+        // First run against a healthy mock Milvus writes a compatible manifest.
+        let healthy = spawn_mock_json_server(HashMap::from([
+            (
+                "/v2/vectordb/collections/has",
+                serde_json::json!({"code": 0, "data": {"has": false}}),
+            ),
+            (
+                "/v2/vectordb/collections/create",
+                serde_json::json!({"code": 0}),
+            ),
+            (
+                "/v2/vectordb/entities/upsert",
+                serde_json::json!({"code": 0}),
+            ),
+            (
+                "/v2/vectordb/entities/delete",
+                serde_json::json!({"code": 0}),
+            ),
+        ]))
+        .await;
+        let embedding = spawn_dynamic_mock_embedding_server().await;
+        let state = IndexerState::new(
+            CodeWalker::new(),
+            CodeSplitter::new(SplitterConfig {
+                root_path: root.to_path_buf(),
+                max_chunk_bytes: Config::default().chunk_size,
+                overlap_lines: Config::default().chunk_overlap / 80,
+                ..SplitterConfig::default()
+            }),
+            Embedder::Http(
+                EmbeddingClient::new(EmbeddingConfig {
+                    url: format!("{}/v1/embeddings", embedding.base_url),
+                    model: "test".to_string(),
+                    batch_size: 100,
+                    api_key: None,
+                    query_prefix: String::new(),
+                    passage_prefix: String::new(),
+                })
+                .unwrap(),
+            ),
+            VectorStore::Milvus(crate::vectordb::MilvusClient::new(&healthy.base_url, None)),
+            4,
+        );
+        index_codebase(&state, root, false).await.unwrap();
+        fs::write(root.join("other.py"), "def sub(a, b):\n    return a - b\n").unwrap();
+
+        // Second run: the existence check fails (mock knows no routes).
+        // Drop the provenance record first: the broken mock lives on a
+        // different port, which would otherwise trip the backend-mismatch
+        // refusal before the existence check this test targets.
+        ManifestStore.clear_backend(root).unwrap();
+        let broken = spawn_mock_json_server(HashMap::new()).await;
+        let state = IndexerState::new(
+            CodeWalker::new(),
+            CodeSplitter::new(SplitterConfig {
+                root_path: root.to_path_buf(),
+                max_chunk_bytes: Config::default().chunk_size,
+                overlap_lines: Config::default().chunk_overlap / 80,
+                ..SplitterConfig::default()
+            }),
+            Embedder::Http(
+                EmbeddingClient::new(EmbeddingConfig {
+                    url: format!("{}/v1/embeddings", embedding.base_url),
+                    model: "test".to_string(),
+                    batch_size: 100,
+                    api_key: None,
+                    query_prefix: String::new(),
+                    passage_prefix: String::new(),
+                })
+                .unwrap(),
+            ),
+            VectorStore::Milvus(crate::vectordb::MilvusClient::new(&broken.base_url, None)),
+            4,
+        );
+
+        let err = index_codebase(&state, root, false).await.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Failed to check vector collection existence"));
+        assert_eq!(state.get_status().await.status, IndexState::Failed);
+
+        embedding.wait().await;
+        healthy.wait().await;
+        broken.wait().await;
+    }
+
+    #[tokio::test]
+    async fn test_lexical_only_indexing_refuses_live_semantic_collection() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let cache_dir = TempDir::new().unwrap();
+        let _cache_lock = set_test_cache_dir_async(cache_dir.path()).await;
+        fs::write(root.join("main.py"), "def add(a, b):\n    return a + b\n").unwrap();
+
+        // Simulate a semantic collection previously built for this path.
+        let collection = collection_name_from_path(root);
+        let local = crate::vectordb::LocalStore::new();
+        local.create_collection(&collection, 4).unwrap();
+
+        let state = make_lexical_indexer_state(root);
+        let err = index_codebase(&state, root, false).await.unwrap_err();
+        assert!(err.to_string().contains("embeddings are disabled"));
+        assert_eq!(state.get_status().await.status, IndexState::Failed);
+    }
+
+    #[tokio::test]
+    async fn test_lexical_only_indexing_refuses_recorded_remote_vectors() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let cache_dir = TempDir::new().unwrap();
+        let _cache_lock = set_test_cache_dir_async(cache_dir.path()).await;
+        fs::write(root.join("main.py"), "def add(a, b):\n    return a + b\n").unwrap();
+
+        // Simulate a semantic index built elsewhere (e.g. Milvus via the MCP
+        // server): no local collection, but the shared status records vectors.
+        ManifestStore
+            .write_status(
+                root,
+                &IndexStatus {
+                    total_files: 1,
+                    processed_files: 1,
+                    total_chunks: 3,
+                    embeddings_generated: 3,
+                    vectors_inserted: 3,
+                    status: IndexState::Completed,
+                },
+            )
+            .unwrap();
+
+        let state = make_lexical_indexer_state(root);
+        let err = index_codebase(&state, root, false).await.unwrap_err();
+        assert!(err.to_string().contains("embeddings are disabled"));
+        assert_eq!(state.get_status().await.status, IndexState::Failed);
+    }
+
+    #[tokio::test]
+    async fn test_lexical_only_refusal_preserves_remote_vector_evidence() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let cache_dir = TempDir::new().unwrap();
+        let _cache_lock = set_test_cache_dir_async(cache_dir.path()).await;
+        fs::write(root.join("main.py"), "def add(a, b):\n    return a + b\n").unwrap();
+
+        let recorded = IndexStatus {
+            total_files: 1,
+            processed_files: 1,
+            total_chunks: 3,
+            embeddings_generated: 3,
+            vectors_inserted: 3,
+            status: IndexState::Completed,
+        };
+        ManifestStore.write_status(root, &recorded).unwrap();
+
+        // Refuse twice: the first refusal must not zero the persisted vector
+        // count, or the second run would sail through and go stale.
+        for _ in 0..2 {
+            let state = make_lexical_indexer_state(root);
+            let err = index_codebase(&state, root, false).await.unwrap_err();
+            assert!(err.to_string().contains("embeddings are disabled"));
+            assert_eq!(state.get_status().await.status, IndexState::Failed);
+        }
+        let persisted = ManifestStore.load_status(root).unwrap().unwrap();
+        assert_eq!(persisted.vectors_inserted, 3);
+        assert_eq!(persisted.status, IndexState::Completed);
+    }
+
+    #[tokio::test]
+    async fn test_api_run_preserves_remote_vector_evidence() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let cache_dir = TempDir::new().unwrap();
+        let _cache_lock = set_test_cache_dir_async(cache_dir.path()).await;
+        fs::write(root.join("main.py"), "def add(a, b):\n    return a + b\n").unwrap();
+
+        let recorded = IndexStatus {
+            total_files: 1,
+            processed_files: 1,
+            total_chunks: 3,
+            embeddings_generated: 3,
+            vectors_inserted: 3,
+            status: IndexState::Completed,
+        };
+        ManifestStore.write_status(root, &recorded).unwrap();
+
+        // Full API path (not just the engine): Indexer::index must refuse the
+        // lexical-only run and must not destroy the persisted vector count.
+        let api = crate::api::Indexer::with_components(
+            Config::default(),
+            Embedder::Disabled,
+            VectorStore::Local(crate::vectordb::LocalStore::new()),
+        );
+        for _ in 0..2 {
+            let err = api.index(root, false).await.unwrap_err();
+            assert!(format!("{err:#}").contains("embeddings are disabled"));
+        }
+        let persisted = ManifestStore.load_status(root).unwrap().unwrap();
+        assert_eq!(persisted.vectors_inserted, 3);
+        assert_eq!(persisted.status, IndexState::Completed);
+    }
+
+    #[tokio::test]
+    async fn test_milvus_search_missing_collection_returns_empty() {
+        let milvus = spawn_mock_json_server(HashMap::from([(
+            "/v2/vectordb/entities/search",
+            serde_json::json!({"code": 100, "message": "can't find collection"}),
+        )]))
+        .await;
+        let store = VectorStore::Milvus(crate::vectordb::MilvusClient::new(&milvus.base_url, None));
+
+        let hits = store.search("missing", &[0.1, 0.2], 5).await.unwrap();
+        assert!(hits.is_empty());
+        milvus.wait().await;
+    }
+
+    #[tokio::test]
+    async fn test_clear_refuses_when_recorded_vectors_are_invisible() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let cache_dir = TempDir::new().unwrap();
+        let _cache_lock = set_test_cache_dir_async(cache_dir.path()).await;
+
+        ManifestStore
+            .write_status(
+                root,
+                &IndexStatus {
+                    total_files: 1,
+                    processed_files: 1,
+                    total_chunks: 3,
+                    embeddings_generated: 3,
+                    vectors_inserted: 3,
+                    status: IndexState::Completed,
+                },
+            )
+            .unwrap();
+
+        // No collection visible to the configured (local) backend: refuse.
+        let api = crate::api::Indexer::with_components(
+            Config::default(),
+            Embedder::Disabled,
+            VectorStore::Local(crate::vectordb::LocalStore::new()),
+        );
+        let err = api.clear(root).await.unwrap_err();
+        assert!(format!("{err:#}").contains("cannot"));
+        assert_eq!(
+            ManifestStore
+                .load_status(root)
+                .unwrap()
+                .unwrap()
+                .vectors_inserted,
+            3
+        );
+
+        // A same-named but underfilled local collection is not sufficient
+        // evidence: the recorded vectors may live in a backend we cannot see.
+        let collection = collection_name_from_path(root);
+        let local = crate::vectordb::LocalStore::new();
+        local.create_collection(&collection, 4).unwrap();
+        assert!(api.clear(root).await.is_err());
+
+        // Once the visible collection holds the recorded count, clear works.
+        local
+            .insert_rows(
+                &collection,
+                &["a".into(), "b".into(), "c".into()],
+                &["x".into(), "y".into(), "z".into()],
+                &[vec![0.1; 4], vec![0.2; 4], vec![0.3; 4]],
+                &[
+                    crate::vectordb::ChunkMeta::default(),
+                    crate::vectordb::ChunkMeta::default(),
+                    crate::vectordb::ChunkMeta::default(),
+                ],
+            )
+            .unwrap();
+        api.clear(root).await.unwrap();
+        assert!(ManifestStore.load_status(root).unwrap().is_none());
+        // Fresh store instance: the old one still caches the collection in
+        // memory; the on-disk file is what clear must have removed.
+        assert!(!crate::vectordb::LocalStore::new()
+            .has_collection(&collection)
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_failed_incremental_update_preserves_vector_evidence() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let cache_dir = TempDir::new().unwrap();
+        let _cache_lock = set_test_cache_dir_async(cache_dir.path()).await;
+        fs::write(root.join("main.py"), "def add(a, b):\n    return a + b\n").unwrap();
+
+        // First run against healthy mocks records real vector counts.
+        let milvus = spawn_mock_json_server(HashMap::from([
+            (
+                "/v2/vectordb/collections/has",
+                serde_json::json!({"code": 0, "data": {"has": true}}),
+            ),
+            (
+                "/v2/vectordb/collections/create",
+                serde_json::json!({"code": 0}),
+            ),
+            (
+                "/v2/vectordb/entities/upsert",
+                serde_json::json!({"code": 0}),
+            ),
+            (
+                "/v2/vectordb/entities/delete",
+                serde_json::json!({"code": 0}),
+            ),
+            (
+                "/v2/vectordb/collections/drop",
+                serde_json::json!({"code": 0}),
+            ),
+        ]))
+        .await;
+        let embedding = spawn_dynamic_mock_embedding_server().await;
+        let make_state = |embedding_url: &str| {
+            IndexerState::new(
+                CodeWalker::new(),
+                CodeSplitter::new(SplitterConfig {
+                    root_path: root.to_path_buf(),
+                    max_chunk_bytes: Config::default().chunk_size,
+                    overlap_lines: Config::default().chunk_overlap / 80,
+                    ..SplitterConfig::default()
+                }),
+                Embedder::Http(
+                    EmbeddingClient::new(EmbeddingConfig {
+                        url: format!("{}/v1/embeddings", embedding_url),
+                        model: "test".to_string(),
+                        batch_size: 100,
+                        api_key: None,
+                        query_prefix: String::new(),
+                        passage_prefix: String::new(),
+                    })
+                    .unwrap(),
+                ),
+                VectorStore::Milvus(crate::vectordb::MilvusClient::new(&milvus.base_url, None)),
+                4,
+            )
+        };
+        let first = index_codebase(&make_state(&embedding.base_url), root, false)
+            .await
+            .unwrap();
+        assert!(first.vectors_inserted > 0);
+
+        // Change a file, then fail the incremental run at the embedding stage.
+        fs::write(root.join("main.py"), "def add(a, b):\n    return b + a\n").unwrap();
+        let dead_embedding = spawn_mock_json_server(HashMap::new()).await;
+        let state = make_state(&dead_embedding.base_url);
+        index_codebase(&state, root, false).await.unwrap_err();
+
+        // The failure must not zero the durable vector evidence.
+        let persisted = ManifestStore.load_status(root).unwrap().unwrap();
+        assert_eq!(persisted.status, IndexState::Failed);
+        assert!(persisted.vectors_inserted >= first.vectors_inserted);
+
+        embedding.wait().await;
+        dead_embedding.wait().await;
+        milvus.wait().await;
+    }
+
+    #[tokio::test]
+    async fn test_backend_switch_requires_clear() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let cache_dir = TempDir::new().unwrap();
+        let _cache_lock = set_test_cache_dir_async(cache_dir.path()).await;
+        fs::write(root.join("main.py"), "def add(a, b):\n    return a + b\n").unwrap();
+
+        let embedding = spawn_dynamic_mock_embedding_server().await;
+        let make_local_state = || {
+            IndexerState::new(
+                CodeWalker::new(),
+                CodeSplitter::new(SplitterConfig {
+                    root_path: root.to_path_buf(),
+                    max_chunk_bytes: Config::default().chunk_size,
+                    overlap_lines: Config::default().chunk_overlap / 80,
+                    ..SplitterConfig::default()
+                }),
+                Embedder::Http(
+                    EmbeddingClient::new(EmbeddingConfig {
+                        url: format!("{}/v1/embeddings", embedding.base_url),
+                        model: "test".to_string(),
+                        batch_size: 100,
+                        api_key: None,
+                        query_prefix: String::new(),
+                        passage_prefix: String::new(),
+                    })
+                    .unwrap(),
+                ),
+                VectorStore::Local(crate::vectordb::LocalStore::new()),
+                4,
+            )
+        };
+
+        // Build against the local backend; provenance is recorded.
+        let first = index_codebase(&make_local_state(), root, false)
+            .await
+            .unwrap();
+        assert!(first.vectors_inserted > 0);
+        assert_eq!(
+            ManifestStore.load_backend(root).unwrap().as_deref(),
+            Some("local")
+        );
+
+        // Simulate the index having been produced by a different backend.
+        ManifestStore
+            .write_backend(root, "milvus http://elsewhere:19530")
+            .unwrap();
+
+        // Incremental update refuses the mismatch outright.
+        let err = update_codebase_index(&make_local_state(), root)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("vector backend"));
+
+        // A plain index run refuses too: rebuilding into the wrong backend
+        // would advance the shared manifest while the recorded backend's
+        // vectors go stale.
+        let err = index_codebase(&make_local_state(), root, false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("vector backend"));
+
+        // Even --force refuses: re-homing without retiring the recorded
+        // backend's collection would let it authenticate the new manifest.
+        let err = index_codebase(&make_local_state(), root, true)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("vector backend"));
+
+        // After clear retires the record (the sanctioned re-homing path),
+        // indexing into the new backend proceeds and rewrites provenance.
+        ManifestStore.clear_backend(root).unwrap();
+        let rebuilt = index_codebase(&make_local_state(), root, true)
+            .await
+            .unwrap();
+        assert!(rebuilt.chunks_created > 0);
+        assert_eq!(
+            ManifestStore.load_backend(root).unwrap().as_deref(),
+            Some("local")
+        );
+
+        embedding.wait().await;
+    }
+
+    #[tokio::test]
+    async fn test_sibling_manifest_rewrite_invalidates_backend_record() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let cache_dir = TempDir::new().unwrap();
+        let _cache_lock = set_test_cache_dir_async(cache_dir.path()).await;
+        fs::write(root.join("main.py"), "def add(a, b):\n    return a + b\n").unwrap();
+
+        ManifestStore
+            .write_for_files(
+                root,
+                "collection",
+                &IndexInputs {
+                    chunk_size: 512,
+                    overlap_lines: 3,
+                    min_chunk_lines: 5,
+                    target_chunk_lines: 50,
+                    extensions: vec!["py".into()],
+                    ignore_patterns: vec![],
+                    max_file_size: 1024 * 1024,
+                    follow_symlinks: false,
+                    embedding_passage_prefix_sha256: String::new(),
+                    embedding_dimension: 0,
+                },
+                &[root.join("main.py")],
+            )
+            .unwrap();
+        ManifestStore.write_backend(root, "local").unwrap();
+        assert_eq!(
+            ManifestStore.load_backend(root).unwrap().as_deref(),
+            Some("local")
+        );
+
+        // Simulate rust_sindexer rewriting the shared manifest (it does not
+        // know about the sidecar): the record must stop authenticating.
+        let manifest_path = root.join(".sindexer").join("index-manifest.json");
+        let mut manifest_json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        manifest_json["files"][0]["sha256"] = serde_json::json!("rewritten-by-sibling");
+        fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&manifest_json).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(ManifestStore.load_backend(root).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn test_search_skips_semantic_on_backend_mismatch() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let cache_dir = TempDir::new().unwrap();
+        let _cache_lock = set_test_cache_dir_async(cache_dir.path()).await;
+        fs::write(root.join("main.py"), "def add(a, b):\n    return a + b\n").unwrap();
+
+        ManifestStore
+            .write_for_files(
+                root,
+                "collection",
+                &IndexInputs {
+                    chunk_size: 512,
+                    overlap_lines: 3,
+                    min_chunk_lines: 5,
+                    target_chunk_lines: 50,
+                    extensions: vec!["py".into()],
+                    ignore_patterns: vec![],
+                    max_file_size: 1024 * 1024,
+                    follow_symlinks: false,
+                    embedding_passage_prefix_sha256: String::new(),
+                    embedding_dimension: 0,
+                },
+                &[root.join("main.py")],
+            )
+            .unwrap();
+        ManifestStore
+            .write_backend(root, "milvus http://elsewhere:19530")
+            .unwrap();
+
+        // Embedder points at a dead endpoint: if the semantic path ran, the
+        // search would fail. The provenance mismatch must skip it instead.
+        let api = crate::api::Indexer::with_components(
+            Config::default(),
+            Embedder::Http(
+                EmbeddingClient::new(EmbeddingConfig {
+                    url: "http://127.0.0.1:9/v1/embeddings".to_string(),
+                    model: "test".to_string(),
+                    batch_size: 100,
+                    api_key: None,
+                    query_prefix: String::new(),
+                    passage_prefix: String::new(),
+                })
+                .unwrap(),
+            ),
+            VectorStore::Local(crate::vectordb::LocalStore::new()),
+        );
+        let hits = api.search(root, "add", 5, &[]).await.unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_clear_refuses_backend_mismatch_even_with_zero_vectors() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let cache_dir = TempDir::new().unwrap();
+        let _cache_lock = set_test_cache_dir_async(cache_dir.path()).await;
+        fs::write(root.join("main.py"), "def add(a, b):\n    return a + b\n").unwrap();
+
+        // A semantic index in another backend that happens to hold zero
+        // vectors (e.g. built from an empty repository): the provenance
+        // record is the only evidence, and clear must respect it.
+        ManifestStore
+            .write_for_files(
+                root,
+                "collection",
+                &IndexInputs {
+                    chunk_size: 512,
+                    overlap_lines: 3,
+                    min_chunk_lines: 5,
+                    target_chunk_lines: 50,
+                    extensions: vec!["py".into()],
+                    ignore_patterns: vec![],
+                    max_file_size: 1024 * 1024,
+                    follow_symlinks: false,
+                    embedding_passage_prefix_sha256: String::new(),
+                    embedding_dimension: 0,
+                },
+                &[root.join("main.py")],
+            )
+            .unwrap();
+        ManifestStore
+            .write_backend(root, "milvus http://elsewhere:19530")
+            .unwrap();
+
+        let api = crate::api::Indexer::with_components(
+            Config::default(),
+            Embedder::Disabled,
+            VectorStore::Local(crate::vectordb::LocalStore::new()),
+        );
+        let err = api.clear(root).await.unwrap_err();
+        assert!(format!("{err:#}").contains("vector backend"));
+        assert!(ManifestStore.load(root).unwrap().is_some());
+
+        // With the record gone (backend reconfigured or manually removed),
+        // clear proceeds.
+        ManifestStore.clear_backend(root).unwrap();
+        api.clear(root).await.unwrap();
+        assert!(ManifestStore.load(root).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_lexical_only_indexing_refuses_provenance_record() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let cache_dir = TempDir::new().unwrap();
+        let _cache_lock = set_test_cache_dir_async(cache_dir.path()).await;
+        fs::write(root.join("main.py"), "def add(a, b):\n    return a + b\n").unwrap();
+
+        // Zero recorded vectors and no visible collection, but an
+        // authenticated provenance record: still semantic state.
+        ManifestStore
+            .write_for_files(
+                root,
+                "collection",
+                &IndexInputs {
+                    chunk_size: 512,
+                    overlap_lines: 3,
+                    min_chunk_lines: 5,
+                    target_chunk_lines: 50,
+                    extensions: vec!["py".into()],
+                    ignore_patterns: vec![],
+                    max_file_size: 1024 * 1024,
+                    follow_symlinks: false,
+                    embedding_passage_prefix_sha256: String::new(),
+                    embedding_dimension: 0,
+                },
+                &[root.join("main.py")],
+            )
+            .unwrap();
+        ManifestStore
+            .write_backend(root, "milvus http://elsewhere:19530")
+            .unwrap();
+
+        let state = make_lexical_indexer_state(root);
+        let err = index_codebase(&state, root, false).await.unwrap_err();
+        assert!(err.to_string().contains("embeddings are disabled"));
+        assert_eq!(state.get_status().await.status, IndexState::Failed);
+    }
+
+    #[tokio::test]
+    async fn test_index_fails_when_provenance_cannot_be_recorded() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let cache_dir = TempDir::new().unwrap();
+        let _cache_lock = set_test_cache_dir_async(cache_dir.path()).await;
+        fs::write(root.join("main.py"), "def add(a, b):\n    return a + b\n").unwrap();
+
+        // A directory squatting on the record path makes the write fail.
+        fs::create_dir_all(root.join(".sindexer").join("vector-backend.json")).unwrap();
+
+        let embedding = spawn_dynamic_mock_embedding_server().await;
+        let state = IndexerState::new(
+            CodeWalker::new(),
+            CodeSplitter::new(SplitterConfig {
+                root_path: root.to_path_buf(),
+                max_chunk_bytes: Config::default().chunk_size,
+                overlap_lines: Config::default().chunk_overlap / 80,
+                ..SplitterConfig::default()
+            }),
+            Embedder::Http(
+                EmbeddingClient::new(EmbeddingConfig {
+                    url: format!("{}/v1/embeddings", embedding.base_url),
+                    model: "test".to_string(),
+                    batch_size: 100,
+                    api_key: None,
+                    query_prefix: String::new(),
+                    passage_prefix: String::new(),
+                })
+                .unwrap(),
+            ),
+            VectorStore::Local(crate::vectordb::LocalStore::new()),
+            4,
+        );
+
+        let err = index_codebase(&state, root, false).await.unwrap_err();
+        assert!(format!("{err:#}").contains("provenance"));
+        assert_eq!(state.get_status().await.status, IndexState::Failed);
+        // The manifest written this run is rolled back: without an
+        // authenticating record it must not survive to validate anything.
+        assert!(ManifestStore.load(root).unwrap().is_none());
+        embedding.wait().await;
+    }
+
+    #[tokio::test]
+    async fn test_malformed_status_file_fails_instead_of_reading_as_absent() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let cache_dir = TempDir::new().unwrap();
+        let _cache_lock = set_test_cache_dir_async(cache_dir.path()).await;
+        fs::write(root.join("main.py"), "def add(a, b):\n    return a + b\n").unwrap();
+
+        let status_path = root.join(".sindexer").join("index-status.json");
+        fs::create_dir_all(status_path.parent().unwrap()).unwrap();
+        fs::write(&status_path, "{ not valid json").unwrap();
+
+        let state = make_lexical_indexer_state(root);
+        let err = index_codebase(&state, root, false).await.unwrap_err();
+        assert!(format!("{err:#}").contains("persisted index status"));
+        assert_eq!(state.get_status().await.status, IndexState::Failed);
+        // The malformed file is preserved for inspection, not overwritten.
+        assert_eq!(
+            fs::read_to_string(&status_path).unwrap(),
+            "{ not valid json"
+        );
+    }
+
+    #[tokio::test]
     async fn test_lexical_only_indexing() {
         let temp_dir = TempDir::new().unwrap();
         let root = temp_dir.path();
@@ -1377,7 +2389,7 @@ mod tests {
                 ..SplitterConfig::default()
             }),
             Embedder::Disabled,
-            VectorStore::new(),
+            VectorStore::Local(crate::vectordb::LocalStore::new()),
             384,
         );
 

@@ -50,7 +50,7 @@ pub struct Indexer {
 }
 
 impl Indexer {
-    pub fn new(config: Config) -> Self {
+    pub fn new(config: Config) -> Result<Self> {
         let embedder_mode = if config.has_embedding_url() {
             "http"
         } else {
@@ -63,12 +63,12 @@ impl Indexer {
             embedding_dimension = config.embedding_dimension,
             "Indexer initialized"
         );
-        Self {
-            state: Arc::new(ContextState::new(config)),
-        }
+        Ok(Self {
+            state: Arc::new(ContextState::new(config)?),
+        })
     }
 
-    pub fn from_env() -> Self {
+    pub fn from_env() -> Result<Self> {
         Self::new(Config::from_env())
     }
 
@@ -119,8 +119,12 @@ impl Indexer {
         info!(force, incremental_only, "Starting index operation");
         let start = Instant::now();
 
-        let indexer_state = create_indexer_state(&self.state, path);
-        self.state.set_status(
+        let indexer_state = create_indexer_state(&self.state, path)?;
+        // In-memory only: the engine owns the persisted status. Writing a
+        // zeroed status to disk here would destroy the previous run's record
+        // (e.g. the vector count guarding lexical-only runs) before the
+        // engine can read it.
+        self.state.indexing_status.insert(
             path.to_path_buf(),
             IndexStatus {
                 status: IndexState::Indexing,
@@ -134,8 +138,16 @@ impl Indexer {
         let status_mirror = tokio::spawn(async move {
             loop {
                 let status = is_clone.get_status().await;
-                let done = !matches!(status.status, IndexState::Indexing);
-                state_for_mirror.set_status(path_clone.clone(), status);
+                let done = matches!(status.status, IndexState::Completed | IndexState::Failed);
+                // Skip the engine's initial Idle so we never clobber the
+                // Indexing marker set above, and stay in-memory: persisting
+                // here would overwrite the engine's own status writes (a
+                // refused run deliberately restores the pre-run file).
+                if status.status != IndexState::Idle {
+                    state_for_mirror
+                        .indexing_status
+                        .insert(path_clone.clone(), status);
+                }
                 if done {
                     break;
                 }
@@ -148,6 +160,17 @@ impl Indexer {
         } else {
             indexer::index_codebase(&indexer_state, path, force).await
         };
+        // The mirror task only exits on a terminal status; if an error path
+        // ever returns while the status still says Indexing, force it to
+        // Failed so the CLI reports the error instead of hanging here.
+        if indexer_state.get_status().await.status == IndexState::Indexing {
+            let mut status = indexer_state.indexing_status.write().await;
+            status.status = if result.is_ok() {
+                IndexState::Completed
+            } else {
+                IndexState::Failed
+            };
+        }
         let _ = status_mirror.await;
 
         match &result {
@@ -195,8 +218,37 @@ impl Indexer {
 
         let collection = collection_name_from_path(path);
 
+        // Semantic hits are only trustworthy if the configured backend is
+        // the one the recorded index was built against; after a re-home, a
+        // surviving same-named collection in the old backend would fuse
+        // stale vectors into current results. Lexical retrieval stays valid
+        // either way, so skip semantic instead of failing the search.
+        // An error reading provenance is treated like a mismatch (skip
+        // semantic, keep lexical) rather than as absent: silently degrading
+        // would bypass the safeguard.
+        let provenance_ok = match self.state.manifest_store.load_backend(path) {
+            Err(e) => {
+                warn!(error = %e, "Failed to read backend provenance; skipping semantic hits");
+                false
+            }
+            Ok(Some(recorded)) => {
+                let current = self.state.vector_store.provenance();
+                if recorded == current {
+                    true
+                } else {
+                    warn!(
+                        recorded_backend = %recorded,
+                        current_backend = %current,
+                        "Vector backend differs from the recorded index; skipping semantic hits"
+                    );
+                    false
+                }
+            }
+            Ok(None) => true,
+        };
+
         let semantic_start = Instant::now();
-        let vector_hits = if self.state.embedder.is_enabled() {
+        let vector_hits = if provenance_ok && self.state.embedder.is_enabled() {
             let hits = self.state.search(&collection, query, limit).await?;
             debug!(
                 count = hits.len(),
@@ -255,14 +307,24 @@ impl Indexer {
 
         Ok(fused
             .into_iter()
-            .map(|hit| SearchHit {
-                file_path: hit.chunk.file_path,
-                relative_path: hit.chunk.relative_path,
-                content: hit.chunk.content,
-                start_line: hit.chunk.start_line,
-                end_line: hit.chunk.end_line,
-                language: hit.chunk.language,
-                score: hit.score,
+            .map(|hit| {
+                // Semantic hits carry the absolute path recorded by whichever
+                // host indexed them; rebuild from the local checkout so shared
+                // (identity-scoped) collections resolve to real local files.
+                let file_path = if hit.chunk.relative_path.is_empty() {
+                    hit.chunk.file_path
+                } else {
+                    rebuild_local_path(path, &hit.chunk.relative_path)
+                };
+                SearchHit {
+                    file_path,
+                    relative_path: hit.chunk.relative_path,
+                    content: hit.chunk.content,
+                    start_line: hit.chunk.start_line,
+                    end_line: hit.chunk.end_line,
+                    language: hit.chunk.language,
+                    score: hit.score,
+                }
             })
             .collect())
     }
@@ -284,6 +346,71 @@ impl Indexer {
             .vector_store
             .has_collection(&collection_name)
             .await?;
+        // The provenance record is evidence in itself, independent of the
+        // vector count: even an empty collection in the recorded backend
+        // must be dropped by that backend, or a later rebuild would let the
+        // surviving collection shadow the new index.
+        if let Some(recorded) = self
+            .state
+            .manifest_store
+            .load_backend(path)
+            .context("failed to read backend provenance record")?
+        {
+            let current = self.state.vector_store.provenance();
+            if recorded != current {
+                bail!(
+                    "The recorded index for {} was built against vector backend '{}' but the \
+                     current backend is '{}'; configure the recorded backend so clear can drop \
+                     its collection, or remove {}/.sindexer/ manually",
+                    path.display(),
+                    recorded,
+                    current,
+                    path.display()
+                );
+            }
+        }
+        // Clearing must not destroy the durable evidence of vectors held in
+        // a backend this environment cannot see (e.g. Milvus without
+        // MILVUS_URL): the surviving remote collection plus a later rebuilt
+        // compatible manifest would present stale semantic results as
+        // current.
+        let recorded_vectors = self
+            .state
+            .manifest_store
+            .load_status(path)
+            .ok()
+            .flatten()
+            .map(|status| status.vectors_inserted)
+            .unwrap_or(0);
+        // A same-named collection in the local store is not proof that the
+        // recorded vectors are visible: they may live in Milvus while a
+        // stale local copy shadows them. For the local backend, require the
+        // visible collection to hold at least the recorded count. Milvus
+        // row counts lag inserts, so the remote backend keeps the
+        // existence-only check (dropping there reaches the real vectors).
+        let evidence_visible = match &self.state.vector_store {
+            VectorStore::Milvus(_) => had_vector,
+            VectorStore::Local(_) => {
+                had_vector
+                    && self
+                        .state
+                        .vector_store
+                        .collection_stats(&collection_name)
+                        .await
+                        .map(|stats| stats.row_count as usize >= recorded_vectors)
+                        .unwrap_or(false)
+            }
+        };
+        if recorded_vectors > 0 && !evidence_visible {
+            bail!(
+                "The recorded index for {} has vectors in a backend this environment cannot \
+                 see (e.g. Milvus without MILVUS_URL set); configure that backend so clear can \
+                 drop the collection, or remove {}/.sindexer/ manually if the vectors are \
+                 already gone",
+                path.display(),
+                path.display()
+            );
+        }
         if had_vector {
             self.state
                 .vector_store
@@ -294,6 +421,14 @@ impl Indexer {
         self.state
             .set_status(path.to_path_buf(), IndexStatus::default());
         let _ = self.state.manifest_store.clear_status(path);
+        // The manifest must go with the lexical index: a surviving manifest
+        // makes the next index/update report "already up to date" against an
+        // empty index.
+        self.state
+            .manifest_store
+            .clear_manifest(path)
+            .context("failed to remove index manifest")?;
+        let _ = self.state.manifest_store.clear_backend(path);
         self.state.indexing_status.remove(&path.to_path_buf());
 
         let lexical_path = path.to_path_buf();
@@ -336,6 +471,18 @@ impl Indexer {
     }
 }
 
+/// Join a stored relative path onto the local checkout root, accepting both
+/// separator styles: an identity-scoped collection indexed on Windows stores
+/// backslash-separated paths that must still resolve on Unix hosts (and vice
+/// versa). A literal backslash in a Unix filename loses to this rule, which
+/// is the right trade for cross-host shared collections.
+fn rebuild_local_path(root: &Path, relative: &str) -> PathBuf {
+    relative
+        .split(['/', '\\'])
+        .filter(|component| !component.is_empty())
+        .fold(root.to_path_buf(), |acc, component| acc.join(component))
+}
+
 fn validate_directory(path: &Path) -> Result<()> {
     if !path.is_absolute() {
         bail!("path must be absolute: {}", path.display());
@@ -349,7 +496,7 @@ fn validate_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn create_indexer_state(state: &SharedState, root_path: &Path) -> Arc<IndexerState> {
+fn create_indexer_state(state: &SharedState, root_path: &Path) -> Result<Arc<IndexerState>> {
     let config = &state.config;
     let splitter = CodeSplitter::new(SplitterConfig {
         root_path: root_path.to_path_buf(),
@@ -363,17 +510,36 @@ fn create_indexer_state(state: &SharedState, root_path: &Path) -> Arc<IndexerSta
         Embedder::Http(EmbeddingClient::with_rate_limiter(
             EmbeddingConfig::from_config(config),
             rate_limiter,
-        ))
+        )?)
     } else {
         Embedder::Disabled
     };
 
-    Arc::new(IndexerState::with_concurrency(
+    Ok(Arc::new(IndexerState::with_concurrency(
         CodeWalker::from_config(config),
         splitter,
         embedder,
-        VectorStore::new(),
+        VectorStore::from_config(config),
         config.embedding_dimension,
         config.concurrency,
-    ))
+    )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rebuild_local_path;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn rebuild_local_path_accepts_both_separators() {
+        let root = Path::new("/repo");
+        assert_eq!(
+            rebuild_local_path(root, "src/engine/mod.rs"),
+            PathBuf::from("/repo/src/engine/mod.rs")
+        );
+        assert_eq!(
+            rebuild_local_path(root, "src\\engine\\mod.rs"),
+            PathBuf::from("/repo/src/engine/mod.rs")
+        );
+    }
 }

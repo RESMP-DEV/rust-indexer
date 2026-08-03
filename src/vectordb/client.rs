@@ -1,0 +1,736 @@
+use anyhow::{Context, Result};
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use tracing::{debug, info, warn};
+
+/// A search result from Milvus.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SearchHit {
+    /// Document ID.
+    pub id: String,
+    /// Similarity score (distance).
+    pub score: f32,
+    /// Document content.
+    pub content: String,
+    /// Metadata.
+    pub metadata: serde_json::Value,
+}
+
+/// HTTP client for Milvus vector database.
+#[derive(Clone)]
+pub struct MilvusClient {
+    client: Client,
+    base_url: String,
+}
+
+#[derive(Serialize)]
+struct CreateCollectionRequest {
+    #[serde(rename = "dbName")]
+    db_name: String,
+    #[serde(rename = "collectionName")]
+    collection_name: String,
+    dimension: usize,
+    #[serde(rename = "metricType")]
+    metric_type: String,
+    #[serde(rename = "primaryFieldName")]
+    primary_field_name: String,
+    #[serde(rename = "vectorFieldName")]
+    vector_field_name: String,
+}
+
+#[derive(Serialize)]
+struct HasCollectionRequest {
+    #[serde(rename = "dbName")]
+    db_name: String,
+    #[serde(rename = "collectionName")]
+    collection_name: String,
+}
+
+#[derive(Deserialize)]
+struct HasCollectionResponse {
+    code: i32,
+    data: Option<HasCollectionData>,
+    message: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct HasCollectionData {
+    has: bool,
+}
+
+#[derive(Serialize)]
+struct InsertRequest {
+    #[serde(rename = "dbName")]
+    db_name: String,
+    #[serde(rename = "collectionName")]
+    collection_name: String,
+    data: Vec<InsertRow>,
+}
+
+/// A row to be inserted into Milvus.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InsertRow {
+    /// Unique identifier.
+    pub id: i64,
+    /// Text content.
+    pub content: String,
+    /// Embedding vector.
+    pub vector: Vec<f32>,
+    /// Additional metadata as JSON.
+    pub metadata: serde_json::Value,
+}
+
+#[derive(Serialize)]
+struct SearchRequest {
+    #[serde(rename = "dbName")]
+    db_name: String,
+    #[serde(rename = "collectionName")]
+    collection_name: String,
+    data: Vec<Vec<f32>>,
+    #[serde(rename = "annsField")]
+    anns_field: String,
+    limit: usize,
+    #[serde(rename = "outputFields")]
+    output_fields: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct SearchResponse {
+    code: i32,
+    data: Option<SearchResultsData>,
+    message: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum SearchResultsData {
+    Flat(Vec<SearchResultItem>),
+    Nested(Vec<Vec<SearchResultItem>>),
+}
+
+#[derive(Deserialize)]
+struct SearchResultItem {
+    id: serde_json::Value,
+    distance: f32,
+    content: Option<String>,
+    metadata: Option<serde_json::Value>,
+}
+
+#[derive(Serialize)]
+struct DeleteRequest {
+    #[serde(rename = "dbName")]
+    db_name: String,
+    #[serde(rename = "collectionName")]
+    collection_name: String,
+    filter: String,
+}
+
+#[derive(Deserialize)]
+struct MilvusResponse {
+    code: i32,
+    message: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct InsertResponse {
+    code: i32,
+    data: Option<InsertResponseData>,
+    message: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct InsertResponseData {
+    // The upsert endpoint reports `upsertCount`; older insert responses used
+    // `insertCount`. Accept both or a real accepted count reads as zero and
+    // the pipeline aborts with "inserted 0 vectors".
+    #[serde(rename = "insertCount", alias = "upsertCount", default)]
+    insert_count: usize,
+}
+
+#[derive(Serialize)]
+struct DropCollectionRequest {
+    #[serde(rename = "dbName")]
+    db_name: String,
+    #[serde(rename = "collectionName")]
+    collection_name: String,
+}
+
+#[derive(Serialize)]
+struct ListCollectionsRequest {
+    #[serde(rename = "dbName")]
+    db_name: String,
+}
+
+#[derive(Deserialize)]
+struct ListCollectionsResponse {
+    code: i32,
+    data: Option<Vec<String>>,
+    message: Option<String>,
+}
+
+#[derive(Serialize)]
+struct CollectionStatsRequest {
+    #[serde(rename = "dbName")]
+    db_name: String,
+    #[serde(rename = "collectionName")]
+    collection_name: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CollectionStats {
+    pub row_count: u64,
+}
+
+#[derive(Deserialize)]
+struct CollectionStatsResponse {
+    code: i32,
+    data: Option<CollectionStatsData>,
+    message: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CollectionStatsData {
+    #[serde(rename = "rowCount", default)]
+    row_count: u64,
+}
+
+impl MilvusClient {
+    /// Create a new Milvus client.
+    ///
+    /// # Arguments
+    /// * `base_url` - Base URL for Milvus REST API (e.g., "http://localhost:19530")
+    pub fn new(base_url: &str, token: Option<String>) -> Self {
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Some(ref token) = token {
+            match format!("Bearer {}", token).parse::<reqwest::header::HeaderValue>() {
+                Ok(mut value) => {
+                    value.set_sensitive(true);
+                    headers.insert(reqwest::header::AUTHORIZATION, value);
+                }
+                Err(_) => warn!(
+                    "MILVUS_TOKEN is not a valid HTTP header value; sending unauthenticated requests"
+                ),
+            }
+        }
+
+        let client = Client::builder()
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            .pool_max_idle_per_host(32)
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(60))
+            .default_headers(headers)
+            .build()
+            .expect("failed to create HTTP client");
+
+        Self {
+            client,
+            // Normalized at construction so request URLs never contain
+            // "//v2/..." and provenance identities are slash-insensitive.
+            base_url: base_url.trim_end_matches('/').to_string(),
+        }
+    }
+
+    /// Base URL this client talks to (used for backend provenance).
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    /// Create a collection with the specified name and vector dimension.
+    ///
+    /// Uses cosine similarity as the metric type. The collection will have:
+    /// - `id` as the primary field (VARCHAR)
+    /// - `content` for document text (VARCHAR)
+    /// - `vector` for embeddings (FLOAT_VECTOR)
+    /// - `metadata` for additional data (JSON)
+    pub async fn create_collection(&self, name: &str, dimension: usize) -> Result<()> {
+        info!(collection = name, dimension, endpoint = %self.base_url, "Creating Milvus collection");
+        let start = std::time::Instant::now();
+        let url = format!("{}/v2/vectordb/collections/create", self.base_url);
+
+        let request = CreateCollectionRequest {
+            db_name: "default".to_string(),
+            collection_name: name.to_string(),
+            dimension,
+            metric_type: "COSINE".to_string(),
+            primary_field_name: "id".to_string(),
+            vector_field_name: "vector".to_string(),
+        };
+
+        let response: MilvusResponse = self
+            .client
+            .post(&url)
+            .json(&request)
+            .send()
+            .await
+            .context("failed to send create collection request")?
+            .json()
+            .await
+            .context("failed to parse create collection response")?;
+
+        if response.code != 0 {
+            let msg = response
+                .message
+                .unwrap_or_else(|| "unknown error".to_string());
+            warn!(collection = name, code = response.code, error = %msg, "Create collection failed");
+            anyhow::bail!("create collection failed: {}", msg);
+        }
+
+        debug!(
+            collection = name,
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            "Milvus collection created"
+        );
+        Ok(())
+    }
+
+    /// Check if a collection exists.
+    pub async fn has_collection(&self, name: &str) -> Result<bool> {
+        let url = format!("{}/v2/vectordb/collections/has", self.base_url);
+
+        let request = HasCollectionRequest {
+            db_name: "default".to_string(),
+            collection_name: name.to_string(),
+        };
+
+        let response: HasCollectionResponse = self
+            .client
+            .post(&url)
+            .json(&request)
+            .send()
+            .await
+            .context("failed to send has collection request")?
+            .json()
+            .await
+            .context("failed to parse has collection response")?;
+
+        if response.code != 0 {
+            anyhow::bail!(
+                "has collection failed: {}",
+                response
+                    .message
+                    .unwrap_or_else(|| "unknown error".to_string())
+            );
+        }
+
+        Ok(response.data.map(|d| d.has).unwrap_or(false))
+    }
+
+    /// Search for similar vectors in a collection.
+    ///
+    /// # Arguments
+    /// * `collection` - Collection name
+    /// * `vector` - Query vector
+    /// * `top_k` - Number of results to return
+    pub async fn search(
+        &self,
+        collection: &str,
+        vector: &[f32],
+        top_k: usize,
+    ) -> Result<Vec<SearchHit>> {
+        debug!(
+            collection,
+            top_k,
+            vector_dim = vector.len(),
+            "Milvus search starting"
+        );
+        let start = std::time::Instant::now();
+        let url = format!("{}/v2/vectordb/entities/search", self.base_url);
+
+        let request = SearchRequest {
+            db_name: "default".to_string(),
+            collection_name: collection.to_string(),
+            data: vec![vector.to_vec()],
+            anns_field: "vector".to_string(),
+            limit: top_k,
+            output_fields: vec![
+                "id".to_string(),
+                "content".to_string(),
+                "metadata".to_string(),
+            ],
+        };
+
+        let response: SearchResponse = self
+            .client
+            .post(&url)
+            .json(&request)
+            .send()
+            .await
+            .context("failed to send search request")?
+            .json()
+            .await
+            .context("failed to parse search response")?;
+
+        if response.code != 0 {
+            let msg = response
+                .message
+                .unwrap_or_else(|| "unknown error".to_string());
+            // Code 100: collection not found. A repo may only have a lexical
+            // index; treat missing semantic state as an empty result set so
+            // hybrid search degrades instead of failing, without spending an
+            // extra existence round trip per query.
+            if response.code == 100 {
+                debug!(collection, "Milvus collection missing; returning no hits");
+                return Ok(Vec::new());
+            }
+            warn!(collection, code = response.code, error = %msg, "Milvus search failed");
+            anyhow::bail!("search failed: {}", msg);
+        }
+
+        let hits: Vec<SearchHit> = response
+            .data
+            .map(SearchResultsData::into_hits)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|item| SearchHit {
+                id: milvus_search_id_to_string(item.id),
+                score: item.distance,
+                content: item.content.unwrap_or_default(),
+                metadata: item.metadata.unwrap_or(serde_json::Value::Null),
+            })
+            .collect();
+
+        debug!(
+            collection,
+            results = hits.len(),
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            "Milvus search completed"
+        );
+        Ok(hits)
+    }
+
+    /// Delete entities from a collection using a filter expression.
+    ///
+    /// # Arguments
+    /// * `collection` - Collection name
+    /// * `filter` - Filter expression (e.g., `id in ["id1", "id2"]`)
+    pub async fn delete(&self, collection: &str, filter: &str) -> Result<()> {
+        debug!(
+            collection,
+            filter_len = filter.len(),
+            "Milvus delete starting"
+        );
+        let start = std::time::Instant::now();
+        let url = format!("{}/v2/vectordb/entities/delete", self.base_url);
+
+        let request = DeleteRequest {
+            db_name: "default".to_string(),
+            collection_name: collection.to_string(),
+            filter: filter.to_string(),
+        };
+
+        let response: MilvusResponse = self
+            .client
+            .post(&url)
+            .json(&request)
+            .send()
+            .await
+            .context("failed to send delete request")?
+            .json()
+            .await
+            .context("failed to parse delete response")?;
+
+        if response.code != 0 {
+            let msg = response
+                .message
+                .unwrap_or_else(|| "unknown error".to_string());
+            warn!(collection, code = response.code, error = %msg, "Milvus delete failed");
+            anyhow::bail!("delete failed: {}", msg);
+        }
+
+        debug!(
+            collection,
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            "Milvus delete completed"
+        );
+        Ok(())
+    }
+
+    /// Batch insert rows into a collection.
+    ///
+    /// # Arguments
+    /// * `collection` - Collection name
+    /// * `data` - Rows to insert
+    pub async fn insert_batch(&self, collection: &str, data: &[InsertRow]) -> Result<usize> {
+        if data.is_empty() {
+            return Ok(0);
+        }
+
+        let batch_size = data.len();
+        debug!(
+            collection,
+            rows = batch_size,
+            "Milvus insert_batch starting"
+        );
+        let start = std::time::Instant::now();
+        const MAX_RETRIES: u32 = 3;
+        let url = format!("{}/v2/vectordb/entities/upsert", self.base_url);
+
+        let request_body = InsertRequest {
+            db_name: "default".to_string(),
+            collection_name: collection.to_string(),
+            data: data.to_vec(),
+        };
+        let body_bytes = serde_json::to_vec(&request_body)
+            .context("failed to serialize insert batch request")?;
+
+        let mut last_err = None;
+        for attempt in 0..=MAX_RETRIES {
+            if attempt > 0 {
+                let backoff = std::time::Duration::from_millis(500 * 2u64.pow(attempt - 1));
+                tokio::time::sleep(backoff).await;
+            }
+
+            let response = match self
+                .client
+                .post(&url)
+                .header("content-type", "application/json")
+                .body(body_bytes.clone())
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(collection, attempt, error = %e, "Milvus insert_batch request failed");
+                    last_err = Some(format!("request failed: {e}"));
+                    continue;
+                }
+            };
+
+            let status = response.status();
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+                let body = response.text().await.unwrap_or_default();
+                warn!(collection, attempt, status = %status, "Milvus insert_batch retryable error");
+                last_err = Some(format!("Milvus returned {status}: {body}"));
+                continue;
+            }
+
+            let response: InsertResponse = response
+                .json()
+                .await
+                .context("failed to parse insert batch response")?;
+
+            if response.code != 0 {
+                let msg = response
+                    .message
+                    .unwrap_or_else(|| "unknown error".to_string());
+                warn!(collection, code = response.code, error = %msg, "Milvus insert_batch rejected");
+                anyhow::bail!("insert batch failed: {}", msg);
+            }
+
+            debug!(
+                collection,
+                rows = batch_size,
+                inserted = response
+                    .data
+                    .as_ref()
+                    .map(|data| data.insert_count)
+                    .unwrap_or(batch_size),
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                "Milvus insert_batch completed"
+            );
+            return Ok(response
+                .data
+                .map(|data| data.insert_count)
+                .unwrap_or(batch_size));
+        }
+
+        let err_msg = last_err.unwrap_or_else(|| "unknown error".to_string());
+        warn!(collection, retries = MAX_RETRIES, error = %err_msg, "Milvus insert_batch exhausted retries");
+        anyhow::bail!(
+            "insert batch failed after {} retries: {}",
+            MAX_RETRIES,
+            err_msg
+        )
+    }
+
+    /// List all collections in the database.
+    pub async fn list_collections(&self) -> Result<Vec<String>> {
+        let url = format!("{}/v2/vectordb/collections/list", self.base_url);
+
+        let request = ListCollectionsRequest {
+            db_name: "default".to_string(),
+        };
+
+        let response: ListCollectionsResponse = self
+            .client
+            .post(&url)
+            .json(&request)
+            .send()
+            .await
+            .context("failed to send list collections request")?
+            .json()
+            .await
+            .context("failed to parse list collections response")?;
+
+        if response.code != 0 {
+            anyhow::bail!(
+                "list collections failed: {}",
+                response
+                    .message
+                    .unwrap_or_else(|| "unknown error".to_string())
+            );
+        }
+
+        Ok(response.data.unwrap_or_default())
+    }
+
+    /// Get statistics for a collection (row count).
+    pub async fn collection_stats(&self, name: &str) -> Result<CollectionStats> {
+        let url = format!("{}/v2/vectordb/collections/get_stats", self.base_url);
+
+        let request = CollectionStatsRequest {
+            db_name: "default".to_string(),
+            collection_name: name.to_string(),
+        };
+
+        let response: CollectionStatsResponse = self
+            .client
+            .post(&url)
+            .json(&request)
+            .send()
+            .await
+            .context("failed to send collection stats request")?
+            .json()
+            .await
+            .context("failed to parse collection stats response")?;
+
+        if response.code != 0 {
+            anyhow::bail!(
+                "collection stats failed: {}",
+                response
+                    .message
+                    .unwrap_or_else(|| "unknown error".to_string())
+            );
+        }
+
+        let data = response
+            .data
+            .unwrap_or(CollectionStatsData { row_count: 0 });
+        Ok(CollectionStats {
+            row_count: data.row_count,
+        })
+    }
+
+    /// Drop a collection.
+    ///
+    /// # Arguments
+    /// * `name` - Collection name to drop
+    pub async fn drop_collection(&self, name: &str) -> Result<()> {
+        info!(collection = name, "Dropping Milvus collection");
+        let url = format!("{}/v2/vectordb/collections/drop", self.base_url);
+
+        let request = DropCollectionRequest {
+            db_name: "default".to_string(),
+            collection_name: name.to_string(),
+        };
+
+        let response: MilvusResponse = self
+            .client
+            .post(&url)
+            .json(&request)
+            .send()
+            .await
+            .context("failed to send drop collection request")?
+            .json()
+            .await
+            .context("failed to parse drop collection response")?;
+
+        if response.code != 0 {
+            anyhow::bail!(
+                "drop collection failed: {}",
+                response
+                    .message
+                    .unwrap_or_else(|| "unknown error".to_string())
+            );
+        }
+
+        Ok(())
+    }
+}
+
+pub(crate) fn milvus_id_for_chunk_id(id: &str) -> i64 {
+    let digest = Sha256::digest(id.as_bytes());
+    let mut bytes = [0_u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    (u64::from_be_bytes(bytes) & (i64::MAX as u64)) as i64
+}
+
+fn milvus_search_id_to_string(value: serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s,
+        serde_json::Value::Number(n) => n.to_string(),
+        other => other.to_string(),
+    }
+}
+
+impl SearchResultsData {
+    fn into_hits(self) -> Vec<SearchResultItem> {
+        match self {
+            SearchResultsData::Flat(items) => items,
+            SearchResultsData::Nested(groups) => groups.into_iter().next().unwrap_or_default(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn base_url_trailing_slash_is_normalized() {
+        let client = super::MilvusClient::new("http://localhost:19530/", None);
+        assert_eq!(client.base_url(), "http://localhost:19530");
+    }
+
+    #[test]
+    fn insert_response_accepts_upsert_count() {
+        let response: super::InsertResponse = serde_json::from_value(serde_json::json!({
+            "code": 0,
+            "data": {"upsertCount": 5}
+        }))
+        .unwrap();
+        assert_eq!(response.data.unwrap().insert_count, 5);
+
+        let response: super::InsertResponse = serde_json::from_value(serde_json::json!({
+            "code": 0,
+            "data": {"insertCount": 3}
+        }))
+        .unwrap();
+        assert_eq!(response.data.unwrap().insert_count, 3);
+    }
+
+    #[test]
+    fn search_response_accepts_nested_results() {
+        let response: super::SearchResponse = serde_json::from_value(serde_json::json!({
+            "code": 0,
+            "data": [[
+                { "id": 123, "distance": 0.5, "content": "hello", "metadata": {} }
+            ]]
+        }))
+        .unwrap();
+
+        assert_eq!(response.data.unwrap().into_hits().len(), 1);
+    }
+
+    use super::{milvus_id_for_chunk_id, SearchResponse};
+
+    #[test]
+    fn milvus_ids_are_stable_positive_i64s() {
+        let id = milvus_id_for_chunk_id("chunk-1");
+        assert!(id >= 0);
+        assert_eq!(id, milvus_id_for_chunk_id("chunk-1"));
+        assert_ne!(id, milvus_id_for_chunk_id("chunk-2"));
+    }
+
+    #[test]
+    fn search_response_accepts_flat_results() {
+        let response: SearchResponse = serde_json::from_value(serde_json::json!({
+            "code": 0,
+            "data": [
+                { "id": 123, "distance": 0.0, "content": "hello", "metadata": {} }
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(response.data.unwrap().into_hits().len(), 1);
+    }
+}

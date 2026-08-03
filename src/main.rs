@@ -9,7 +9,9 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 ///
 /// Works with zero configuration in lexical-only (BM25) mode. Set
 /// EMBEDDING_URL to any OpenAI-compatible embeddings endpoint to enable
-/// hybrid semantic search.
+/// hybrid semantic search, and MILVUS_URL to use a Milvus/Zilliz backend.
+/// Variables from ~/.context/.env are loaded automatically unless already
+/// set in the environment (the same file the rust_sindexer wrapper uses).
 #[derive(Parser)]
 #[command(name = "rust-indexer", version, about)]
 struct Cli {
@@ -68,6 +70,44 @@ enum Command {
     Collections,
 }
 
+/// Load KEY=VALUE pairs from ~/.context/.env without overriding variables
+/// already present in the environment.
+fn load_env_file() {
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let Ok(contents) = std::fs::read_to_string(PathBuf::from(home).join(".context/.env")) else {
+        return;
+    };
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        let value = value
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+            .unwrap_or(value);
+        if key.is_empty()
+            || key.contains('\0')
+            || value.contains('\0')
+            || (value.starts_with('"') && !value.ends_with('"'))
+            || (value.starts_with('\'') && !value.ends_with('\''))
+        {
+            continue;
+        }
+        if std::env::var_os(key).is_none() {
+            std::env::set_var(key, value);
+        }
+    }
+}
+
 fn absolute(path: PathBuf) -> Result<PathBuf> {
     path.canonicalize()
         .with_context(|| format!("cannot resolve path: {}", path.display()))
@@ -76,6 +116,7 @@ fn absolute(path: PathBuf) -> Result<PathBuf> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    load_env_file();
 
     tracing_subscriber::registry()
         .with(fmt::layer().with_writer(std::io::stderr))
@@ -85,7 +126,7 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let indexer = Indexer::from_env();
+    let indexer = Indexer::from_env()?;
 
     match cli.command {
         Command::Index { path, force } => {
