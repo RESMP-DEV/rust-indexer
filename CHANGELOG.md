@@ -42,4 +42,6 @@
   nonzero vector count (covering vectors held in a backend the current
   environment cannot see), because refreshing the shared manifest without
   updating vectors would permanently hide semantic staleness from both
-  tools.
+  tools. Runs refused before any index mutation restore the pre-run
+  persisted status instead of zeroing it, so the recorded vector evidence
+  survives repeated refusals.

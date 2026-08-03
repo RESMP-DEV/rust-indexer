@@ -139,7 +139,7 @@ async fn run_index_codebase(
         && state.manifest_store.load(path).ok().flatten().is_some()
         && !LexicalIndex::exists(path).unwrap_or(false)
     {
-        update_status_failed(state, path).await;
+        refuse_before_mutation(state, path, previous_status_before_index.as_ref()).await;
         anyhow::bail!(
             "Incremental update requires an existing lexical index for {}; run index --force to rebuild",
             path.display()
@@ -156,7 +156,7 @@ async fn run_index_codebase(
         let has_semantic = match state.vector_store.has_collection(&collection_name).await {
             Ok(has) => has,
             Err(e) => {
-                update_status_failed(state, path).await;
+                refuse_before_mutation(state, path, previous_status_before_index.as_ref()).await;
                 return Err(e).context("Failed to check for an existing vector collection");
             }
         };
@@ -169,7 +169,7 @@ async fn run_index_codebase(
             .map(|status| status.vectors_inserted > 0)
             .unwrap_or(false);
         if has_semantic || status_reports_vectors {
-            update_status_failed(state, path).await;
+            refuse_before_mutation(state, path, previous_status_before_index.as_ref()).await;
             anyhow::bail!(
                 "A semantic index exists for {} (collection {} or a recorded vector count) but \
                  embeddings are disabled; set EMBEDDING_URL (and MILVUS_URL if the vectors live \
@@ -193,7 +193,7 @@ async fn run_index_codebase(
     let files = match state.walker.walk(path).await {
         Ok(files) => files,
         Err(e) => {
-            update_status_failed(state, path).await;
+            refuse_before_mutation(state, path, previous_status_before_index.as_ref()).await;
             return Err(e).context("Failed to walk codebase");
         }
     };
@@ -204,7 +204,7 @@ async fn run_index_codebase(
     let previous_manifest = match state.manifest_store.load(path) {
         Ok(previous) => previous,
         Err(e) => {
-            update_status_failed(state, path).await;
+            refuse_before_mutation(state, path, previous_status_before_index.as_ref()).await;
             return Err(e).context("Failed to load index manifest");
         }
     };
@@ -226,7 +226,8 @@ async fn run_index_codebase(
                 ) {
                     Ok(result) => result,
                     Err(e) => {
-                        update_status_failed(state, path).await;
+                        refuse_before_mutation(state, path, previous_status_before_index.as_ref())
+                            .await;
                         return Err(e).context("Failed to diff index manifest");
                     }
                 };
@@ -237,7 +238,12 @@ async fn run_index_codebase(
                     match state.vector_store.has_collection(&collection_name).await {
                         Ok(has) => has,
                         Err(e) => {
-                            update_status_failed(state, path).await;
+                            refuse_before_mutation(
+                                state,
+                                path,
+                                previous_status_before_index.as_ref(),
+                            )
+                            .await;
                             return Err(e).context("Failed to check vector collection existence");
                         }
                     }
@@ -246,7 +252,8 @@ async fn run_index_codebase(
                 };
                 if embeddings_enabled && !has_collection {
                     if incremental_only {
-                        update_status_failed(state, path).await;
+                        refuse_before_mutation(state, path, previous_status_before_index.as_ref())
+                            .await;
                         anyhow::bail!(
                             "Incremental update requires existing vector collection {}; run index_codebase only when a full rebuild is intended",
                             collection_name
@@ -316,7 +323,8 @@ async fn run_index_codebase(
             }
             Some(_) => {
                 if incremental_only {
-                    update_status_failed(state, path).await;
+                    refuse_before_mutation(state, path, previous_status_before_index.as_ref())
+                        .await;
                     anyhow::bail!(
                         "Incremental update requires a compatible index manifest; run index_codebase only when a full rebuild is intended"
                     );
@@ -325,7 +333,8 @@ async fn run_index_codebase(
             }
             None => {
                 if incremental_only {
-                    update_status_failed(state, path).await;
+                    refuse_before_mutation(state, path, previous_status_before_index.as_ref())
+                        .await;
                     anyhow::bail!(
                         "Incremental update requires an existing index manifest; run index_codebase first only when a full build is intended"
                     );
@@ -792,6 +801,29 @@ async fn update_status_failed(state: &IndexerState, path: &Path) {
     let mut status = state.indexing_status.write().await;
     status.status = IndexState::Failed;
     let _ = state.manifest_store.write_status(path, &status);
+}
+
+/// Fail a run that was refused before mutating any index state. The failure
+/// is recorded in memory, but the persisted status is restored to its
+/// pre-run value: a zeroed Failed status would destroy durable evidence
+/// (such as a recorded vector count) that later runs depend on.
+async fn refuse_before_mutation(
+    state: &IndexerState,
+    path: &Path,
+    previous_status: Option<&IndexStatus>,
+) {
+    {
+        let mut status = state.indexing_status.write().await;
+        status.status = IndexState::Failed;
+    }
+    match previous_status {
+        Some(previous) => {
+            let _ = state.manifest_store.write_status(path, previous);
+        }
+        None => {
+            let _ = state.manifest_store.clear_status(path);
+        }
+    }
 }
 
 async fn update_status_completed_counts(
@@ -1566,6 +1598,37 @@ mod tests {
         let err = index_codebase(&state, root, false).await.unwrap_err();
         assert!(err.to_string().contains("embeddings are disabled"));
         assert_eq!(state.get_status().await.status, IndexState::Failed);
+    }
+
+    #[tokio::test]
+    async fn test_lexical_only_refusal_preserves_remote_vector_evidence() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let cache_dir = TempDir::new().unwrap();
+        let _cache_lock = set_test_cache_dir_async(cache_dir.path()).await;
+        fs::write(root.join("main.py"), "def add(a, b):\n    return a + b\n").unwrap();
+
+        let recorded = IndexStatus {
+            total_files: 1,
+            processed_files: 1,
+            total_chunks: 3,
+            embeddings_generated: 3,
+            vectors_inserted: 3,
+            status: IndexState::Completed,
+        };
+        ManifestStore.write_status(root, &recorded).unwrap();
+
+        // Refuse twice: the first refusal must not zero the persisted vector
+        // count, or the second run would sail through and go stale.
+        for _ in 0..2 {
+            let state = make_lexical_indexer_state(root);
+            let err = index_codebase(&state, root, false).await.unwrap_err();
+            assert!(err.to_string().contains("embeddings are disabled"));
+            assert_eq!(state.get_status().await.status, IndexState::Failed);
+        }
+        let persisted = ManifestStore.load_status(root).unwrap().unwrap();
+        assert_eq!(persisted.vectors_inserted, 3);
+        assert_eq!(persisted.status, IndexState::Completed);
     }
 
     #[tokio::test]
