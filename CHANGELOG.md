@@ -52,4 +52,7 @@
   the shared manifest, status, and lexical index while the recorded status
   shows vectors in a backend the current environment cannot see, since the
   surviving remote collection plus a rebuilt manifest would present stale
-  semantic results as current.
+  semantic results as current. Mid-run failures preserve the prior
+  recorded vector counts unless the run dropped the collection, and the
+  local backend must hold at least the recorded row count before clear
+  treats the evidence as visible.

@@ -346,13 +346,31 @@ async fn run_index_codebase(
 
     if embeddings_enabled {
         if let Err(e) = prepare_vector_index(state, &collection_name, full_reindex).await {
-            update_status_failed(state, path).await;
+            update_status_failed(
+                state,
+                path,
+                if full_reindex {
+                    None
+                } else {
+                    previous_status_before_index.as_ref()
+                },
+            )
+            .await;
             return Err(e).context("Failed to prepare vector collection");
         }
     }
 
     if let Err(e) = prepare_lexical_index(path, &stale_relative_paths, full_reindex).await {
-        update_status_failed(state, path).await;
+        update_status_failed(
+            state,
+            path,
+            if full_reindex {
+                None
+            } else {
+                previous_status_before_index.as_ref()
+            },
+        )
+        .await;
         return Err(e).context("Failed to prepare lexical index");
     }
 
@@ -362,7 +380,16 @@ async fn run_index_codebase(
             .delete_by_relative_paths(&collection_name, &stale_relative_paths)
             .await
         {
-            update_status_failed(state, path).await;
+            update_status_failed(
+                state,
+                path,
+                if full_reindex {
+                    None
+                } else {
+                    previous_status_before_index.as_ref()
+                },
+            )
+            .await;
             return Err(e).context("Failed to delete stale vectors");
         }
     }
@@ -381,7 +408,16 @@ async fn run_index_codebase(
             &files,
             cached_fingerprints.take(),
         ) {
-            update_status_failed(state, path).await;
+            update_status_failed(
+                state,
+                path,
+                if full_reindex {
+                    None
+                } else {
+                    previous_status_before_index.as_ref()
+                },
+            )
+            .await;
             return Err(e).context("Failed to write index manifest");
         }
 
@@ -609,14 +645,32 @@ async fn run_index_codebase(
         .context("Lexical index task panicked")
         .and_then(|r| r)
     {
-        update_status_failed(state, path).await;
+        update_status_failed(
+            state,
+            path,
+            if full_reindex {
+                None
+            } else {
+                previous_status_before_index.as_ref()
+            },
+        )
+        .await;
         return Err(e).context("Failed to update lexical index");
     }
 
     let (embeddings_generated, vectors_inserted, mut embedding_warnings) = match embedding_result {
         Ok(counts) => counts,
         Err(e) => {
-            update_status_failed(state, path).await;
+            update_status_failed(
+                state,
+                path,
+                if full_reindex {
+                    None
+                } else {
+                    previous_status_before_index.as_ref()
+                },
+            )
+            .await;
             return Err(e);
         }
     };
@@ -657,7 +711,16 @@ async fn run_index_codebase(
         &files,
         cached_fingerprints.take(),
     ) {
-        update_status_failed(state, path).await;
+        update_status_failed(
+            state,
+            path,
+            if full_reindex {
+                None
+            } else {
+                previous_status_before_index.as_ref()
+            },
+        )
+        .await;
         return Err(e).context("Failed to write index manifest");
     }
 
@@ -797,9 +860,24 @@ fn split_or_skip_embedding_batch(
     pending.push(batch);
 }
 
-async fn update_status_failed(state: &IndexerState, path: &Path) {
+/// Persist a Failed status for a run that failed after mutations began.
+/// `prior_evidence` (the pre-run status, None when this run dropped the
+/// collection) keeps the durable vector counts from being zeroed by an
+/// early failure: remote vectors still exist, and the lexical-only guard
+/// depends on the recorded count to know that.
+async fn update_status_failed(
+    state: &IndexerState,
+    path: &Path,
+    prior_evidence: Option<&IndexStatus>,
+) {
     let mut status = state.indexing_status.write().await;
     status.status = IndexState::Failed;
+    if let Some(previous) = prior_evidence {
+        status.vectors_inserted = status.vectors_inserted.max(previous.vectors_inserted);
+        status.embeddings_generated = status
+            .embeddings_generated
+            .max(previous.embeddings_generated);
+    }
     let _ = state.manifest_store.write_status(path, &status);
 }
 
@@ -1717,10 +1795,27 @@ mod tests {
             3
         );
 
-        // Once the backend can see (and drop) the collection, clear works.
+        // A same-named but underfilled local collection is not sufficient
+        // evidence: the recorded vectors may live in a backend we cannot see.
         let collection = collection_name_from_path(root);
         let local = crate::vectordb::LocalStore::new();
         local.create_collection(&collection, 4).unwrap();
+        assert!(api.clear(root).await.is_err());
+
+        // Once the visible collection holds the recorded count, clear works.
+        local
+            .insert_rows(
+                &collection,
+                &["a".into(), "b".into(), "c".into()],
+                &["x".into(), "y".into(), "z".into()],
+                &[vec![0.1; 4], vec![0.2; 4], vec![0.3; 4]],
+                &[
+                    crate::vectordb::ChunkMeta::default(),
+                    crate::vectordb::ChunkMeta::default(),
+                    crate::vectordb::ChunkMeta::default(),
+                ],
+            )
+            .unwrap();
         api.clear(root).await.unwrap();
         assert!(ManifestStore.load_status(root).unwrap().is_none());
         // Fresh store instance: the old one still caches the collection in
@@ -1728,6 +1823,81 @@ mod tests {
         assert!(!crate::vectordb::LocalStore::new()
             .has_collection(&collection)
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_failed_incremental_update_preserves_vector_evidence() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let cache_dir = TempDir::new().unwrap();
+        let _cache_lock = set_test_cache_dir_async(cache_dir.path()).await;
+        fs::write(root.join("main.py"), "def add(a, b):\n    return a + b\n").unwrap();
+
+        // First run against healthy mocks records real vector counts.
+        let milvus = spawn_mock_json_server(HashMap::from([
+            (
+                "/v2/vectordb/collections/has",
+                serde_json::json!({"code": 0, "data": {"has": true}}),
+            ),
+            (
+                "/v2/vectordb/collections/create",
+                serde_json::json!({"code": 0}),
+            ),
+            (
+                "/v2/vectordb/entities/insert",
+                serde_json::json!({"code": 0}),
+            ),
+            (
+                "/v2/vectordb/entities/delete",
+                serde_json::json!({"code": 0}),
+            ),
+            (
+                "/v2/vectordb/collections/drop",
+                serde_json::json!({"code": 0}),
+            ),
+        ]))
+        .await;
+        let embedding = spawn_dynamic_mock_embedding_server().await;
+        let make_state = |embedding_url: &str| {
+            IndexerState::new(
+                CodeWalker::new(),
+                CodeSplitter::new(SplitterConfig {
+                    root_path: root.to_path_buf(),
+                    max_chunk_bytes: Config::default().chunk_size,
+                    overlap_lines: Config::default().chunk_overlap / 80,
+                    ..SplitterConfig::default()
+                }),
+                Embedder::Http(EmbeddingClient::new(EmbeddingConfig {
+                    url: format!("{}/v1/embeddings", embedding_url),
+                    model: "test".to_string(),
+                    batch_size: 100,
+                    api_key: None,
+                    query_prefix: String::new(),
+                    passage_prefix: String::new(),
+                })),
+                VectorStore::Milvus(crate::vectordb::MilvusClient::new(&milvus.base_url, None)),
+                4,
+            )
+        };
+        let first = index_codebase(&make_state(&embedding.base_url), root, false)
+            .await
+            .unwrap();
+        assert!(first.vectors_inserted > 0);
+
+        // Change a file, then fail the incremental run at the embedding stage.
+        fs::write(root.join("main.py"), "def add(a, b):\n    return b + a\n").unwrap();
+        let dead_embedding = spawn_mock_json_server(HashMap::new()).await;
+        let state = make_state(&dead_embedding.base_url);
+        index_codebase(&state, root, false).await.unwrap_err();
+
+        // The failure must not zero the durable vector evidence.
+        let persisted = ManifestStore.load_status(root).unwrap().unwrap();
+        assert_eq!(persisted.status, IndexState::Failed);
+        assert!(persisted.vectors_inserted >= first.vectors_inserted);
+
+        embedding.wait().await;
+        dead_embedding.wait().await;
+        milvus.wait().await;
     }
 
     #[tokio::test]

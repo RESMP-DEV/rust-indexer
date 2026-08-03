@@ -328,9 +328,28 @@ impl Indexer {
             .load_status(path)
             .ok()
             .flatten()
-            .map(|status| status.vectors_inserted > 0)
-            .unwrap_or(false);
-        if recorded_vectors && !had_vector {
+            .map(|status| status.vectors_inserted)
+            .unwrap_or(0);
+        // A same-named collection in the local store is not proof that the
+        // recorded vectors are visible: they may live in Milvus while a
+        // stale local copy shadows them. For the local backend, require the
+        // visible collection to hold at least the recorded count. Milvus
+        // row counts lag inserts, so the remote backend keeps the
+        // existence-only check (dropping there reaches the real vectors).
+        let evidence_visible = match &self.state.vector_store {
+            VectorStore::Milvus(_) => had_vector,
+            VectorStore::Local(_) => {
+                had_vector
+                    && self
+                        .state
+                        .vector_store
+                        .collection_stats(&collection_name)
+                        .await
+                        .map(|stats| stats.row_count as usize >= recorded_vectors)
+                        .unwrap_or(false)
+            }
+        };
+        if recorded_vectors > 0 && !evidence_visible {
             bail!(
                 "The recorded index for {} has vectors in a backend this environment cannot \
                  see (e.g. Milvus without MILVUS_URL set); configure that backend so clear can \
