@@ -60,4 +60,10 @@
   sidecar that does not change the shared manifest schema); a backend
   switch forces a full rebuild on `index` and refuses `update`, so a
   same-named collection in a previously used backend cannot satisfy an
-  empty manifest diff with stale vectors.
+  empty manifest diff with stale vectors. The record stores a SHA-256 of
+  the manifest it was written alongside, so a manifest later rewritten by
+  rust_sindexer invalidates the record rather than vouching for vectors it
+  never described; an absent or unauthenticated record adopts the current
+  backend, which is the required behavior for sindexer-built indexes.
+  Fully closing the backend flip-flop window would need rust_sindexer to
+  write the same provenance record (lockstep follow-up).

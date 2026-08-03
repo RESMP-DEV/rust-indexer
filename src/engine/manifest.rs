@@ -188,6 +188,11 @@ impl ManifestStore {
         Ok(())
     }
 
+    /// Load the backend provenance record, but only if it authenticates the
+    /// current manifest: the record stores a hash of the manifest contents it
+    /// was written alongside, so a manifest later rewritten by rust_sindexer
+    /// (which does not know about this sidecar) invalidates the record
+    /// instead of vouching for vectors it never described.
     pub fn load_backend(&self, path: &Path) -> Result<Option<String>> {
         let backend_path = backend_path(path);
         if !backend_path.exists() {
@@ -198,7 +203,16 @@ impl ManifestStore {
         let record: BackendRecord = serde_json::from_str(&contents).with_context(|| {
             format!("failed to parse backend record {}", backend_path.display())
         })?;
-        Ok(Some(record.backend))
+        match current_manifest_sha256(path) {
+            Some(current) if current == record.manifest_sha256 => Ok(Some(record.backend)),
+            _ => {
+                debug!(
+                    path = %path.display(),
+                    "backend record does not match the current manifest; treating as absent"
+                );
+                Ok(None)
+            }
+        }
     }
 
     pub fn write_backend(&self, path: &Path, backend: &str) -> Result<()> {
@@ -213,6 +227,7 @@ impl ManifestStore {
         }
         let json = serde_json::to_string_pretty(&BackendRecord {
             backend: backend.to_string(),
+            manifest_sha256: current_manifest_sha256(path).unwrap_or_default(),
         })
         .context("failed to serialize backend record")?;
         fs::write(&backend_path, json).with_context(|| {
@@ -326,6 +341,14 @@ pub fn fingerprint_files(root: &Path, files: &[PathBuf]) -> Result<Vec<FileFinge
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BackendRecord {
     backend: String,
+    /// SHA-256 of the manifest file this record was written alongside.
+    #[serde(default)]
+    manifest_sha256: String,
+}
+
+fn current_manifest_sha256(root: &Path) -> Option<String> {
+    let contents = fs::read(manifest_path(root)).ok()?;
+    Some(hex::encode(Sha256::digest(&contents)))
 }
 
 fn backend_path(root: &Path) -> PathBuf {

@@ -321,6 +321,11 @@ async fn run_index_codebase(
                         vectors_inserted,
                     )
                     .await;
+                    if embeddings_enabled {
+                        let _ = state
+                            .manifest_store
+                            .write_backend(path, &state.vector_store.provenance());
+                    }
                     return Ok(IndexResult {
                         files_processed: 0,
                         chunks_created: 0,
@@ -2012,6 +2017,53 @@ mod tests {
         );
 
         embedding.wait().await;
+    }
+
+    #[tokio::test]
+    async fn test_sibling_manifest_rewrite_invalidates_backend_record() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let cache_dir = TempDir::new().unwrap();
+        let _cache_lock = set_test_cache_dir_async(cache_dir.path()).await;
+        fs::write(root.join("main.py"), "def add(a, b):\n    return a + b\n").unwrap();
+
+        ManifestStore
+            .write_for_files(
+                root,
+                "collection",
+                &IndexInputs {
+                    chunk_size: 512,
+                    overlap_lines: 3,
+                    min_chunk_lines: 5,
+                    target_chunk_lines: 50,
+                    extensions: vec!["py".into()],
+                    ignore_patterns: vec![],
+                    max_file_size: 1024 * 1024,
+                    follow_symlinks: false,
+                    embedding_passage_prefix_sha256: String::new(),
+                },
+                &[root.join("main.py")],
+            )
+            .unwrap();
+        ManifestStore.write_backend(root, "local").unwrap();
+        assert_eq!(
+            ManifestStore.load_backend(root).unwrap().as_deref(),
+            Some("local")
+        );
+
+        // Simulate rust_sindexer rewriting the shared manifest (it does not
+        // know about the sidecar): the record must stop authenticating.
+        let manifest_path = root.join(".sindexer").join("index-manifest.json");
+        let mut manifest_json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        manifest_json["files"][0]["sha256"] = serde_json::json!("rewritten-by-sibling");
+        fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&manifest_json).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(ManifestStore.load_backend(root).unwrap(), None);
     }
 
     #[tokio::test]
