@@ -34,4 +34,10 @@
   the unused Milvus `Document`/`insert` API was removed; and `clear` now
   deletes the index manifest along with the lexical index so the next
   `index`/`update` rebuilds instead of reporting "already up to date"
-  against an empty index.
+  against an empty index; vector-backend errors during the collection
+  existence check now mark the run failed (previously the CLI could hang
+  waiting on the status mirror), with an additional terminal-status safety
+  net in `Indexer::run_index`; and lexical-only runs now refuse a path whose
+  semantic vector collection exists, because refreshing the shared manifest
+  without updating vectors would permanently hide semantic staleness from
+  both tools.

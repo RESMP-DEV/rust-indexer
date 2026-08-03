@@ -147,6 +147,30 @@ async fn run_index_codebase(
     }
 
     let collection_name = collection_name_from_path(path);
+
+    // A lexical-only run over a path with a live semantic collection would
+    // refresh the shared manifest without touching the vectors, making a
+    // later embeddings-enabled run (here or in rust_sindexer) see an empty
+    // diff and keep stale semantic results forever. Refuse instead.
+    if !embeddings_enabled {
+        let has_semantic = match state.vector_store.has_collection(&collection_name).await {
+            Ok(has) => has,
+            Err(e) => {
+                update_status_failed(state, path).await;
+                return Err(e).context("Failed to check for an existing vector collection");
+            }
+        };
+        if has_semantic {
+            update_status_failed(state, path).await;
+            anyhow::bail!(
+                "A semantic vector collection ({}) exists for {} but embeddings are disabled; \
+                 set EMBEDDING_URL to keep it current, or clear the index before lexical-only indexing",
+                collection_name,
+                path.display()
+            );
+        }
+    }
+
     let index_inputs = IndexInputs::from_splitter_and_walker(
         state.splitter.config(),
         &state.walker.extensions,
@@ -200,9 +224,18 @@ async fn run_index_codebase(
 
                 cached_fingerprints = Some(fingerprints);
 
-                if embeddings_enabled
-                    && !state.vector_store.has_collection(&collection_name).await?
-                {
+                let has_collection = if embeddings_enabled {
+                    match state.vector_store.has_collection(&collection_name).await {
+                        Ok(has) => has,
+                        Err(e) => {
+                            update_status_failed(state, path).await;
+                            return Err(e).context("Failed to check vector collection existence");
+                        }
+                    }
+                } else {
+                    true
+                };
+                if embeddings_enabled && !has_collection {
                     if incremental_only {
                         update_status_failed(state, path).await;
                         anyhow::bail!(
@@ -1391,6 +1424,109 @@ mod tests {
         assert_eq!(state.get_status().await.status, IndexState::Completed);
 
         embedding.wait().await;
+    }
+
+    #[tokio::test]
+    async fn test_index_surfaces_vector_backend_errors_instead_of_hanging() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let cache_dir = TempDir::new().unwrap();
+        let _cache_lock = set_test_cache_dir_async(cache_dir.path()).await;
+        fs::write(root.join("main.py"), "def add(a, b):\n    return a + b\n").unwrap();
+
+        // First run against a healthy mock Milvus writes a compatible manifest.
+        let healthy = spawn_mock_json_server(HashMap::from([
+            (
+                "/v2/vectordb/collections/has",
+                serde_json::json!({"code": 0, "data": {"has": false}}),
+            ),
+            (
+                "/v2/vectordb/collections/create",
+                serde_json::json!({"code": 0}),
+            ),
+            (
+                "/v2/vectordb/entities/insert",
+                serde_json::json!({"code": 0}),
+            ),
+            (
+                "/v2/vectordb/entities/delete",
+                serde_json::json!({"code": 0}),
+            ),
+        ]))
+        .await;
+        let embedding = spawn_dynamic_mock_embedding_server().await;
+        let state = IndexerState::new(
+            CodeWalker::new(),
+            CodeSplitter::new(SplitterConfig {
+                root_path: root.to_path_buf(),
+                max_chunk_bytes: Config::default().chunk_size,
+                overlap_lines: Config::default().chunk_overlap / 80,
+                ..SplitterConfig::default()
+            }),
+            Embedder::Http(EmbeddingClient::new(EmbeddingConfig {
+                url: format!("{}/v1/embeddings", embedding.base_url),
+                model: "test".to_string(),
+                batch_size: 100,
+                api_key: None,
+                query_prefix: String::new(),
+                passage_prefix: String::new(),
+            })),
+            VectorStore::Milvus(crate::vectordb::MilvusClient::new(&healthy.base_url, None)),
+            4,
+        );
+        index_codebase(&state, root, false).await.unwrap();
+        fs::write(root.join("other.py"), "def sub(a, b):\n    return a - b\n").unwrap();
+
+        // Second run: the existence check fails (mock knows no routes).
+        let broken = spawn_mock_json_server(HashMap::new()).await;
+        let state = IndexerState::new(
+            CodeWalker::new(),
+            CodeSplitter::new(SplitterConfig {
+                root_path: root.to_path_buf(),
+                max_chunk_bytes: Config::default().chunk_size,
+                overlap_lines: Config::default().chunk_overlap / 80,
+                ..SplitterConfig::default()
+            }),
+            Embedder::Http(EmbeddingClient::new(EmbeddingConfig {
+                url: format!("{}/v1/embeddings", embedding.base_url),
+                model: "test".to_string(),
+                batch_size: 100,
+                api_key: None,
+                query_prefix: String::new(),
+                passage_prefix: String::new(),
+            })),
+            VectorStore::Milvus(crate::vectordb::MilvusClient::new(&broken.base_url, None)),
+            4,
+        );
+
+        let err = index_codebase(&state, root, false).await.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Failed to check vector collection existence"));
+        assert_eq!(state.get_status().await.status, IndexState::Failed);
+
+        embedding.wait().await;
+        healthy.wait().await;
+        broken.wait().await;
+    }
+
+    #[tokio::test]
+    async fn test_lexical_only_indexing_refuses_live_semantic_collection() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let cache_dir = TempDir::new().unwrap();
+        let _cache_lock = set_test_cache_dir_async(cache_dir.path()).await;
+        fs::write(root.join("main.py"), "def add(a, b):\n    return a + b\n").unwrap();
+
+        // Simulate a semantic collection previously built for this path.
+        let collection = collection_name_from_path(root);
+        let local = crate::vectordb::LocalStore::new();
+        local.create_collection(&collection, 4).unwrap();
+
+        let state = make_lexical_indexer_state(root);
+        let err = index_codebase(&state, root, false).await.unwrap_err();
+        assert!(err.to_string().contains("embeddings are disabled"));
+        assert_eq!(state.get_status().await.status, IndexState::Failed);
     }
 
     #[tokio::test]

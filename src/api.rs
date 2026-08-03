@@ -148,6 +148,17 @@ impl Indexer {
         } else {
             indexer::index_codebase(&indexer_state, path, force).await
         };
+        // The mirror task only exits on a terminal status; if an error path
+        // ever returns while the status still says Indexing, force it to
+        // Failed so the CLI reports the error instead of hanging here.
+        if indexer_state.get_status().await.status == IndexState::Indexing {
+            let mut status = indexer_state.indexing_status.write().await;
+            status.status = if result.is_ok() {
+                IndexState::Completed
+            } else {
+                IndexState::Failed
+            };
+        }
         let _ = status_mirror.await;
 
         match &result {
