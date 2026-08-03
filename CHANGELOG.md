@@ -72,4 +72,6 @@
   write the same provenance record (lockstep follow-up). `search` also
   consults the record: on an authenticated mismatch it skips semantic
   retrieval with a warning instead of fusing stale vectors, while lexical
-  results continue to serve.
+  results continue to serve, and `clear` refuses an authenticated backend
+  mismatch regardless of the recorded vector count, so even an empty
+  remote collection must be dropped by the backend that owns it.

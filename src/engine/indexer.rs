@@ -2122,6 +2122,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_clear_refuses_backend_mismatch_even_with_zero_vectors() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let cache_dir = TempDir::new().unwrap();
+        let _cache_lock = set_test_cache_dir_async(cache_dir.path()).await;
+        fs::write(root.join("main.py"), "def add(a, b):\n    return a + b\n").unwrap();
+
+        // A semantic index in another backend that happens to hold zero
+        // vectors (e.g. built from an empty repository): the provenance
+        // record is the only evidence, and clear must respect it.
+        ManifestStore
+            .write_for_files(
+                root,
+                "collection",
+                &IndexInputs {
+                    chunk_size: 512,
+                    overlap_lines: 3,
+                    min_chunk_lines: 5,
+                    target_chunk_lines: 50,
+                    extensions: vec!["py".into()],
+                    ignore_patterns: vec![],
+                    max_file_size: 1024 * 1024,
+                    follow_symlinks: false,
+                    embedding_passage_prefix_sha256: String::new(),
+                },
+                &[root.join("main.py")],
+            )
+            .unwrap();
+        ManifestStore
+            .write_backend(root, "milvus http://elsewhere:19530")
+            .unwrap();
+
+        let api = crate::api::Indexer::with_components(
+            Config::default(),
+            Embedder::Disabled,
+            VectorStore::Local(crate::vectordb::LocalStore::new()),
+        );
+        let err = api.clear(root).await.unwrap_err();
+        assert!(format!("{err:#}").contains("vector backend"));
+        assert!(ManifestStore.load(root).unwrap().is_some());
+
+        // With the record gone (backend reconfigured or manually removed),
+        // clear proceeds.
+        ManifestStore.clear_backend(root).unwrap();
+        api.clear(root).await.unwrap();
+        assert!(ManifestStore.load(root).unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn test_lexical_only_indexing() {
         let temp_dir = TempDir::new().unwrap();
         let root = temp_dir.path();

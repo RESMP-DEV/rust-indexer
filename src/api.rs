@@ -339,6 +339,24 @@ impl Indexer {
             .vector_store
             .has_collection(&collection_name)
             .await?;
+        // The provenance record is evidence in itself, independent of the
+        // vector count: even an empty collection in the recorded backend
+        // must be dropped by that backend, or a later rebuild would let the
+        // surviving collection shadow the new index.
+        if let Ok(Some(recorded)) = self.state.manifest_store.load_backend(path) {
+            let current = self.state.vector_store.provenance();
+            if recorded != current {
+                bail!(
+                    "The recorded index for {} was built against vector backend '{}' but the \
+                     current backend is '{}'; configure the recorded backend so clear can drop \
+                     its collection, or remove {}/.sindexer/ manually",
+                    path.display(),
+                    recorded,
+                    current,
+                    path.display()
+                );
+            }
+        }
         // Clearing must not destroy the durable evidence of vectors held in
         // a backend this environment cannot see (e.g. Milvus without
         // MILVUS_URL): the surviving remote collection plus a later rebuilt
