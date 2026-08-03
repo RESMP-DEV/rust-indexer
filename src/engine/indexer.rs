@@ -111,7 +111,18 @@ async fn run_index_codebase(
     let start = Instant::now();
     let mut warnings = Vec::new();
     let embeddings_enabled = state.embedder.is_enabled();
-    let previous_status_before_index = state.manifest_store.load_status(path).ok().flatten();
+    // A malformed or unreadable status file is not "no evidence": it may
+    // hold the recorded vector count the lexical-only guard depends on.
+    // Fail in memory and leave the file untouched for inspection.
+    let previous_status_before_index = match state.manifest_store.load_status(path) {
+        Ok(status) => status,
+        Err(e) => {
+            let mut status = state.indexing_status.write().await;
+            status.status = IndexState::Failed;
+            drop(status);
+            return Err(e).context("Failed to read the persisted index status");
+        }
+    };
 
     {
         let status = state.indexing_status.read().await;
@@ -2317,6 +2328,29 @@ mod tests {
         assert!(format!("{err:#}").contains("provenance"));
         assert_eq!(state.get_status().await.status, IndexState::Failed);
         embedding.wait().await;
+    }
+
+    #[tokio::test]
+    async fn test_malformed_status_file_fails_instead_of_reading_as_absent() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let cache_dir = TempDir::new().unwrap();
+        let _cache_lock = set_test_cache_dir_async(cache_dir.path()).await;
+        fs::write(root.join("main.py"), "def add(a, b):\n    return a + b\n").unwrap();
+
+        let status_path = root.join(".sindexer").join("index-status.json");
+        fs::create_dir_all(status_path.parent().unwrap()).unwrap();
+        fs::write(&status_path, "{ not valid json").unwrap();
+
+        let state = make_lexical_indexer_state(root);
+        let err = index_codebase(&state, root, false).await.unwrap_err();
+        assert!(format!("{err:#}").contains("persisted index status"));
+        assert_eq!(state.get_status().await.status, IndexState::Failed);
+        // The malformed file is preserved for inspection, not overwritten.
+        assert_eq!(
+            fs::read_to_string(&status_path).unwrap(),
+            "{ not valid json"
+        );
     }
 
     #[tokio::test]
