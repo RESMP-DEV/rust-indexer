@@ -9,6 +9,10 @@
   instead of degrading to "no provenance", which would have bypassed the
   backend-mismatch safeguards; search treats such errors like a mismatch
   (semantic skipped, lexical served).
+- The Milvus client maps the collection-not-found response (code 100) to an
+  empty semantic result set directly, removing the per-search existence
+  round trip, and warns when only one of `SINDEXER_COLLECTION_IDENTITY` /
+  `SINDEXER_COLLECTION_ROOT` is set.
 
 - Initial fork from rust_sindexer (MCP server variant) as a standalone CLI
   with clap subcommands `index`, `update`, `search`, `status`, `clear`, and
@@ -56,7 +60,7 @@
   persist status at all (the engine is the sole owner of the on-disk
   status file); and hybrid search with a configured Milvus backend now
   returns empty semantic results for a missing collection instead of
-  failing, so lexical-only indexes stay searchable; and \`clear\` refuses to delete
+  failing, so lexical-only indexes stay searchable; and `clear` refuses to delete
   the shared manifest, status, and lexical index while the recorded status
   shows vectors in a backend the current environment cannot see, since the
   surviving remote collection plus a rebuilt manifest would present stale

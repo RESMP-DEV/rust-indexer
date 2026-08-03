@@ -118,13 +118,9 @@ impl VectorStore {
         match self {
             Self::Local(store) => store.search(collection, vector, top_k),
             Self::Milvus(client) => {
-                // A repo may only have a lexical index (indexed without
-                // embeddings); mirror the local store and return an empty
-                // semantic result instead of failing the whole search.
-                if !client.has_collection(collection).await? {
-                    debug!(collection, "Milvus collection missing; semantic hits empty");
-                    return Ok(Vec::new());
-                }
+                // The client maps a missing collection to an empty result
+                // set (a repo may only have a lexical index), so no
+                // pre-flight existence check is needed here.
                 let hits = client.search(collection, vector, top_k).await?;
                 Ok(hits
                     .into_iter()
@@ -225,8 +221,18 @@ fn scoped_collection_identity(
     identity: Option<&str>,
     root: Option<&str>,
 ) -> Option<String> {
-    let identity = identity.and_then(non_empty_trimmed)?;
-    let root = root.and_then(non_empty_trimmed)?;
+    let identity_value = identity.and_then(non_empty_trimmed);
+    let root_value = root.and_then(non_empty_trimmed);
+    if identity_value.is_some() != root_value.is_some() {
+        warn!(
+            identity_set = identity_value.is_some(),
+            root_set = root_value.is_some(),
+            "SINDEXER_COLLECTION_IDENTITY and SINDEXER_COLLECTION_ROOT must both be set for \
+             stable cross-host collection naming; ignoring the partial configuration"
+        );
+    }
+    let identity = identity_value?;
+    let root = root_value?;
     let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let root = Path::new(root)
         .canonicalize()

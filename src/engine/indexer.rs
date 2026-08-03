@@ -1829,8 +1829,8 @@ mod tests {
     #[tokio::test]
     async fn test_milvus_search_missing_collection_returns_empty() {
         let milvus = spawn_mock_json_server(HashMap::from([(
-            "/v2/vectordb/collections/has",
-            serde_json::json!({"code": 0, "data": {"has": false}}),
+            "/v2/vectordb/entities/search",
+            serde_json::json!({"code": 100, "message": "can't find collection"}),
         )]))
         .await;
         let store = VectorStore::Milvus(crate::vectordb::MilvusClient::new(&milvus.base_url, None));

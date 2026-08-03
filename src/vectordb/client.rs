@@ -363,6 +363,14 @@ impl MilvusClient {
             let msg = response
                 .message
                 .unwrap_or_else(|| "unknown error".to_string());
+            // Code 100: collection not found. A repo may only have a lexical
+            // index; treat missing semantic state as an empty result set so
+            // hybrid search degrades instead of failing, without spending an
+            // extra existence round trip per query.
+            if response.code == 100 {
+                debug!(collection, "Milvus collection missing; returning no hits");
+                return Ok(Vec::new());
+            }
             warn!(collection, code = response.code, error = %msg, "Milvus search failed");
             anyhow::bail!("search failed: {}", msg);
         }
