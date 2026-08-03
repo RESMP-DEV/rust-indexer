@@ -16,7 +16,9 @@
   for an embeddings-enabled run to report success, and Milvus URLs are
   normalized (trailing slashes stripped) at client construction, keeping
   request URLs free of double slashes and backend identities
-  slash-insensitive.
+  slash-insensitive. Search result paths rebuilt from the local checkout
+  accept both separator styles, so collections indexed on Windows resolve
+  on Unix hosts and vice versa.
 
 - Initial fork from rust_sindexer (MCP server variant) as a standalone CLI
   with clap subcommands `index`, `update`, `search`, `status`, `clear`, and

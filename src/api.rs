@@ -314,7 +314,7 @@ impl Indexer {
                 let file_path = if hit.chunk.relative_path.is_empty() {
                     hit.chunk.file_path
                 } else {
-                    path.join(&hit.chunk.relative_path)
+                    rebuild_local_path(path, &hit.chunk.relative_path)
                 };
                 SearchHit {
                     file_path,
@@ -471,6 +471,18 @@ impl Indexer {
     }
 }
 
+/// Join a stored relative path onto the local checkout root, accepting both
+/// separator styles: an identity-scoped collection indexed on Windows stores
+/// backslash-separated paths that must still resolve on Unix hosts (and vice
+/// versa). A literal backslash in a Unix filename loses to this rule, which
+/// is the right trade for cross-host shared collections.
+fn rebuild_local_path(root: &Path, relative: &str) -> PathBuf {
+    relative
+        .split(['/', '\\'])
+        .filter(|component| !component.is_empty())
+        .fold(root.to_path_buf(), |acc, component| acc.join(component))
+}
+
 fn validate_directory(path: &Path) -> Result<()> {
     if !path.is_absolute() {
         bail!("path must be absolute: {}", path.display());
@@ -482,6 +494,25 @@ fn validate_directory(path: &Path) -> Result<()> {
         bail!("path is not a directory: {}", path.display());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rebuild_local_path;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn rebuild_local_path_accepts_both_separators() {
+        let root = Path::new("/repo");
+        assert_eq!(
+            rebuild_local_path(root, "src/engine/mod.rs"),
+            PathBuf::from("/repo/src/engine/mod.rs")
+        );
+        assert_eq!(
+            rebuild_local_path(root, "src\\engine\\mod.rs"),
+            PathBuf::from("/repo/src/engine/mod.rs")
+        );
+    }
 }
 
 fn create_indexer_state(state: &SharedState, root_path: &Path) -> Result<Arc<IndexerState>> {
