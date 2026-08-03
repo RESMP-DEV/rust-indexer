@@ -39,6 +39,31 @@ machine-readable output (useful when calling from agents or scripts).
 - **Hybrid semantic + lexical** — set `EMBEDDING_URL` to any OpenAI-compatible
   embeddings endpoint. Results are fused with reciprocal rank fusion.
 
+### Recommended: Jina Code Embeddings on MLX
+
+The intended embedding backend is the quantized
+[jina-code-embeddings-1.5b-mxfp4](https://huggingface.co/RESMP-DEV/jina-code-embeddings-1.5b-mxfp4-block-gptq)
+model served locally via
+[jina-code-mlx](https://github.com/RESMP-DEV/AlphaHENG/tree/main/contrib/jina-code-mlx).
+It runs on Apple Silicon with native Metal acceleration and produces
+1536-dimensional code-aware embeddings.
+
+If the Jina MLX server is running on port 1235 (the default LaunchAgent
+configuration), configure rust-indexer like this:
+
+```bash
+export EMBEDDING_URL=http://127.0.0.1:1235/v1/embeddings
+export EMBEDDING_MODEL=jina-code-embeddings-1.5b-block-gptq-mxfp4-32k
+export EMBEDDING_DIMENSION=1536
+
+rust-indexer index ~/code/my-project
+rust-indexer search "where do we retry failed uploads" -p ~/code/my-project
+```
+
+Any OpenAI-compatible endpoint works, but Jina code embeddings are
+purpose-built for code search and the quantized MLX variant keeps the
+embedding server local and fast.
+
 ## Storage
 
 - `<repo>/.rust-indexer/` — index manifest (per-file SHA-256) and status.
