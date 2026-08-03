@@ -25,6 +25,8 @@ pub struct IndexInputs {
     pub follow_symlinks: bool,
     #[serde(default)]
     pub embedding_passage_prefix_sha256: String,
+    #[serde(default)]
+    pub embedding_dimension: usize,
 }
 
 fn default_max_file_size() -> u64 {
@@ -39,6 +41,7 @@ impl IndexInputs {
         max_file_size: u64,
         follow_symlinks: bool,
         embedding_passage_prefix: &str,
+        embedding_dimension: usize,
     ) -> Self {
         Self {
             chunk_size: splitter.max_chunk_bytes,
@@ -54,6 +57,7 @@ impl IndexInputs {
             } else {
                 format!("{:x}", Sha256::digest(embedding_passage_prefix.as_bytes()))
             },
+            embedding_dimension,
         }
     }
 }
@@ -398,6 +402,7 @@ mod tests {
             max_file_size: 1024 * 1024,
             follow_symlinks: false,
             embedding_passage_prefix_sha256: String::new(),
+            embedding_dimension: 0,
         };
 
         let previous = IndexManifest {
@@ -442,6 +447,7 @@ mod tests {
             max_file_size: 1024 * 1024,
             follow_symlinks: false,
             embedding_passage_prefix_sha256: String::new(),
+            embedding_dimension: 0,
         };
         let store = ManifestStore;
         let files = vec![src.join("lib.rs")];
@@ -476,6 +482,7 @@ mod tests {
         assert_eq!(manifest.inputs.max_file_size, 1024 * 1024);
         assert!(!manifest.inputs.follow_symlinks);
         assert_eq!(manifest.inputs.embedding_passage_prefix_sha256, "");
+        assert_eq!(manifest.inputs.embedding_dimension, 0);
     }
 
     #[test]
@@ -490,6 +497,7 @@ mod tests {
             1024 * 1024,
             false,
             "passage-a:\n",
+            384,
         );
         let second = IndexInputs::from_splitter_and_walker(
             &splitter,
@@ -498,6 +506,7 @@ mod tests {
             1024 * 1024,
             false,
             "passage-b:\n",
+            384,
         );
 
         assert_ne!(first.embedding_passage_prefix_sha256, "");
@@ -550,6 +559,7 @@ mod tests {
             max_file_size: 1024 * 1024,
             follow_symlinks: false,
             embedding_passage_prefix_sha256: String::new(),
+            embedding_dimension: 0,
         };
         let store = ManifestStore;
         store

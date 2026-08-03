@@ -237,6 +237,7 @@ async fn run_index_codebase(
         state.walker.max_file_size,
         state.walker.follow_symlinks,
         state.embedder.passage_prefix(),
+        state.embedding_dimension,
     );
 
     // Phase 1: Walk files
@@ -2126,6 +2127,7 @@ mod tests {
                     max_file_size: 1024 * 1024,
                     follow_symlinks: false,
                     embedding_passage_prefix_sha256: String::new(),
+                    embedding_dimension: 0,
                 },
                 &[root.join("main.py")],
             )
@@ -2173,6 +2175,7 @@ mod tests {
                     max_file_size: 1024 * 1024,
                     follow_symlinks: false,
                     embedding_passage_prefix_sha256: String::new(),
+                    embedding_dimension: 0,
                 },
                 &[root.join("main.py")],
             )
@@ -2227,6 +2230,7 @@ mod tests {
                     max_file_size: 1024 * 1024,
                     follow_symlinks: false,
                     embedding_passage_prefix_sha256: String::new(),
+                    embedding_dimension: 0,
                 },
                 &[root.join("main.py")],
             )
@@ -2275,6 +2279,7 @@ mod tests {
                     max_file_size: 1024 * 1024,
                     follow_symlinks: false,
                     embedding_passage_prefix_sha256: String::new(),
+                    embedding_dimension: 0,
                 },
                 &[root.join("main.py")],
             )

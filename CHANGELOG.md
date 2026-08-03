@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Manifest parity with rust_sindexer PR #12: `IndexInputs` records
+  `embedding_dimension` (serde default 0 for older manifests), so a
+  dimension change invalidates the shared manifest identically in both
+  tools and cross-tool writes stop forcing full rebuilds.
+
 - Fix: parse `upsertCount` from Milvus upsert responses (the endpoint switch
   to upsert left the client reading only `insertCount`, so every accepted
   batch counted as zero vectors and indexing aborted).
