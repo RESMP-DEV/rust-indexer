@@ -343,9 +343,18 @@ async fn run_index_codebase(
                     )
                     .await;
                     if embeddings_enabled {
-                        let _ = state
+                        if let Err(e) = state
                             .manifest_store
-                            .write_backend(path, &state.vector_store.provenance());
+                            .write_backend(path, &state.vector_store.provenance())
+                        {
+                            update_status_failed(
+                                state,
+                                path,
+                                previous_status_before_index.as_ref(),
+                            )
+                            .await;
+                            return Err(e).context("Failed to record vector backend provenance");
+                        }
                     }
                     return Ok(IndexResult {
                         files_processed: 0,
@@ -487,9 +496,18 @@ async fn run_index_codebase(
             0
         };
         if embeddings_enabled {
-            let _ = state
+            if let Err(e) = state
                 .manifest_store
-                .write_backend(path, &state.vector_store.provenance());
+                .write_backend(path, &state.vector_store.provenance())
+            {
+                update_status_failed(
+                    state,
+                    path,
+                    failure_evidence(full_reindex, previous_status_before_index.as_ref()),
+                )
+                .await;
+                return Err(e).context("Failed to record vector backend provenance");
+            }
         }
         {
             let mut status = state.indexing_status.write().await;
@@ -790,9 +808,18 @@ async fn run_index_codebase(
     }
 
     if embeddings_enabled {
-        let _ = state
+        if let Err(e) = state
             .manifest_store
-            .write_backend(path, &state.vector_store.provenance());
+            .write_backend(path, &state.vector_store.provenance())
+        {
+            update_status_failed(
+                state,
+                path,
+                failure_evidence(full_reindex, previous_status_before_index.as_ref()),
+            )
+            .await;
+            return Err(e).context("Failed to record vector backend provenance");
+        }
     }
     {
         let mut status = state.indexing_status.write().await;
@@ -928,6 +955,17 @@ fn split_or_skip_embedding_batch(
     let right = batch.split_off(batch.len() / 2);
     pending.push(right);
     pending.push(batch);
+}
+
+/// Evidence to preserve on failure: the pre-run status, unless this run
+/// dropped the collection (full reindex), in which case partial counts are
+/// the truth.
+fn failure_evidence(full_reindex: bool, previous: Option<&IndexStatus>) -> Option<&IndexStatus> {
+    if full_reindex {
+        None
+    } else {
+        previous
+    }
 }
 
 /// Persist a Failed status for a run that failed after mutations began.
@@ -2245,6 +2283,47 @@ mod tests {
         let err = index_codebase(&state, root, false).await.unwrap_err();
         assert!(err.to_string().contains("embeddings are disabled"));
         assert_eq!(state.get_status().await.status, IndexState::Failed);
+    }
+
+    #[tokio::test]
+    async fn test_index_fails_when_provenance_cannot_be_recorded() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let cache_dir = TempDir::new().unwrap();
+        let _cache_lock = set_test_cache_dir_async(cache_dir.path()).await;
+        fs::write(root.join("main.py"), "def add(a, b):\n    return a + b\n").unwrap();
+
+        // A directory squatting on the record path makes the write fail.
+        fs::create_dir_all(root.join(".sindexer").join("vector-backend.json")).unwrap();
+
+        let embedding = spawn_dynamic_mock_embedding_server().await;
+        let state = IndexerState::new(
+            CodeWalker::new(),
+            CodeSplitter::new(SplitterConfig {
+                root_path: root.to_path_buf(),
+                max_chunk_bytes: Config::default().chunk_size,
+                overlap_lines: Config::default().chunk_overlap / 80,
+                ..SplitterConfig::default()
+            }),
+            Embedder::Http(
+                EmbeddingClient::new(EmbeddingConfig {
+                    url: format!("{}/v1/embeddings", embedding.base_url),
+                    model: "test".to_string(),
+                    batch_size: 100,
+                    api_key: None,
+                    query_prefix: String::new(),
+                    passage_prefix: String::new(),
+                })
+                .unwrap(),
+            ),
+            VectorStore::Local(crate::vectordb::LocalStore::new()),
+            4,
+        );
+
+        let err = index_codebase(&state, root, false).await.unwrap_err();
+        assert!(format!("{err:#}").contains("provenance"));
+        assert_eq!(state.get_status().await.status, IndexState::Failed);
+        embedding.wait().await;
     }
 
     #[tokio::test]
