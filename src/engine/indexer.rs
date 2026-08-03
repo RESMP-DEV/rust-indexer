@@ -939,11 +939,12 @@ fn split_or_skip_embedding_batch(
 }
 
 /// Persist the backend provenance record; on failure, roll back so no
-/// unauthenticated state survives: the possibly-partial sidecar is removed,
-/// and if this run just rewrote the manifest, the manifest goes too (a
-/// missing manifest forces full revalidation next run, which is safe; a new
-/// manifest without an authenticating record would let a stale same-named
-/// backend be adopted as current).
+/// unauthenticated state survives. The record write is atomic (temp +
+/// rename), so a failure leaves any previously valid record intact; when
+/// this run just rewrote the manifest, the manifest is rolled back (a
+/// missing manifest forces full revalidation next run, which is safe; a
+/// new manifest without an authenticating record would let a stale
+/// same-named backend be adopted as current).
 async fn record_backend_or_rollback(
     state: &IndexerState,
     path: &Path,
@@ -954,7 +955,6 @@ async fn record_backend_or_rollback(
         .manifest_store
         .write_backend(path, &state.vector_store.provenance())
     {
-        let _ = state.manifest_store.clear_backend(path);
         if manifest_written_this_run {
             let _ = state.manifest_store.clear_manifest(path);
         }

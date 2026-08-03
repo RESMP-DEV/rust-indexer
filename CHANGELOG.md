@@ -17,7 +17,9 @@
   fails the run (file preserved for inspection) instead of reading as
   zero vector evidence; and a provenance-record write failure now rolls
   back the manifest written in the same run, so an unauthenticated fresh
-  manifest cannot let a stale same-named backend be adopted as current.
+  manifest cannot let a stale same-named backend be adopted as current. The record
+  write itself is atomic (temp file + rename), so a failed rewrite on an
+  unchanged run preserves the previously valid record.
 - The Milvus client maps the collection-not-found response (code 100) to an
   empty semantic result set directly, removing the per-search existence
   round trip, and warns when only one of `SINDEXER_COLLECTION_IDENTITY` /

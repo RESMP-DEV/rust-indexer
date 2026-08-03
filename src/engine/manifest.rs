@@ -234,8 +234,18 @@ impl ManifestStore {
             manifest_sha256: current_manifest_sha256(path)?.unwrap_or_default(),
         })
         .context("failed to serialize backend record")?;
-        fs::write(&backend_path, json).with_context(|| {
-            format!("failed to write backend record {}", backend_path.display())
+        // Atomic replace: a failed write must never destroy an existing
+        // valid record (temp write + rename leaves the old file intact on
+        // any failure).
+        let tmp_path = backend_path.with_extension("json.tmp");
+        fs::write(&tmp_path, json)
+            .with_context(|| format!("failed to write backend record {}", tmp_path.display()))?;
+        fs::rename(&tmp_path, &backend_path).map_err(|e| {
+            let _ = fs::remove_file(&tmp_path);
+            anyhow::Error::new(e).context(format!(
+                "failed to replace backend record {}",
+                backend_path.display()
+            ))
         })?;
         Ok(())
     }
