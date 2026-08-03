@@ -58,7 +58,10 @@
   treats the evidence as visible. Embeddings-enabled runs record backend
   provenance in `.sindexer/vector-backend.json` (a rust-indexer-owned
   sidecar that does not change the shared manifest schema); a backend
-  switch forces a full rebuild on `index` and refuses `update`, so a
+  switch refuses both `index` and `update` (rebuilding into the wrong
+  backend would advance the shared manifest while the recorded backend's
+  vectors go stale); `index --force` is the explicit override for
+  re-homing an index, so a
   same-named collection in a previously used backend cannot satisfy an
   empty manifest diff with stale vectors. The record stores a SHA-256 of
   the manifest it was written alongside, so a manifest later rewritten by

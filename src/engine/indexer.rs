@@ -243,26 +243,26 @@ async fn run_index_codebase(
                     let current_backend = state.vector_store.provenance();
                     match state.manifest_store.load_backend(path) {
                         Ok(Some(recorded)) if recorded != current_backend => {
-                            if incremental_only {
-                                refuse_before_mutation(
-                                    state,
-                                    path,
-                                    previous_status_before_index.as_ref(),
-                                )
-                                .await;
-                                anyhow::bail!(
-                                    "The recorded index was built against vector backend '{}' but the \
-                                     current backend is '{}'; run index --force to rebuild",
-                                    recorded,
-                                    current_backend
-                                );
-                            }
-                            warn!(
-                                recorded_backend = %recorded,
-                                current_backend = %current_backend,
-                                "Vector backend changed since the last index; forcing a full rebuild"
+                            // Refuse rather than rebuild: a rebuild into the
+                            // currently selected backend would advance the
+                            // shared manifest, which rust_sindexer would then
+                            // trust while its vectors in the recorded backend
+                            // go stale. `index --force` remains the explicit
+                            // override for deliberately re-homing the index.
+                            refuse_before_mutation(
+                                state,
+                                path,
+                                previous_status_before_index.as_ref(),
+                            )
+                            .await;
+                            anyhow::bail!(
+                                "The recorded index was built against vector backend '{}' but the \
+                                 current backend is '{}'; configure the recorded backend, or run \
+                                 index --force only if you intend to re-home the index to the \
+                                 current backend",
+                                recorded,
+                                current_backend
                             );
-                            full_reindex = true;
                         }
                         _ => {}
                     }
@@ -1646,6 +1646,10 @@ mod tests {
         fs::write(root.join("other.py"), "def sub(a, b):\n    return a - b\n").unwrap();
 
         // Second run: the existence check fails (mock knows no routes).
+        // Drop the provenance record first: the broken mock lives on a
+        // different port, which would otherwise trip the backend-mismatch
+        // refusal before the existence check this test targets.
+        ManifestStore.clear_backend(root).unwrap();
         let broken = spawn_mock_json_server(HashMap::new()).await;
         let state = IndexerState::new(
             CodeWalker::new(),
@@ -1950,7 +1954,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_backend_switch_forces_rebuild_and_blocks_incremental() {
+    async fn test_backend_switch_refuses_until_forced() {
         let temp_dir = TempDir::new().unwrap();
         let root = temp_dir.path();
         let cache_dir = TempDir::new().unwrap();
@@ -2001,16 +2005,19 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("vector backend"));
 
-        // A plain index run forces a full rebuild instead of reporting
-        // "already up to date" against the wrong backend's vectors.
-        let rebuilt = index_codebase(&make_local_state(), root, false)
+        // A plain index run refuses too: rebuilding into the wrong backend
+        // would advance the shared manifest while the recorded backend's
+        // vectors go stale.
+        let err = index_codebase(&make_local_state(), root, false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("vector backend"));
+
+        // The explicit override re-homes the index and rewrites provenance.
+        let rebuilt = index_codebase(&make_local_state(), root, true)
             .await
             .unwrap();
         assert!(rebuilt.chunks_created > 0);
-        assert!(!rebuilt
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("already up to date")));
         assert_eq!(
             ManifestStore.load_backend(root).unwrap().as_deref(),
             Some("local")
