@@ -94,7 +94,15 @@ fn load_env_file() {
             .and_then(|v| v.strip_suffix('"'))
             .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
             .unwrap_or(value);
-        if !key.is_empty() && std::env::var_os(key).is_none() {
+        if key.is_empty()
+            || key.contains('\0')
+            || value.contains('\0')
+            || (value.starts_with('"') && !value.ends_with('"'))
+            || (value.starts_with('\'') && !value.ends_with('\''))
+        {
+            continue;
+        }
+        if std::env::var_os(key).is_none() {
             std::env::set_var(key, value);
         }
     }

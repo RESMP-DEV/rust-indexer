@@ -4,20 +4,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
-/// A document to be inserted into Milvus.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Document {
-    /// Unique identifier for the document.
-    pub id: String,
-    /// Text content of the document.
-    pub content: String,
-    /// Embedding vector.
-    pub vector: Vec<f32>,
-    /// Additional metadata as JSON.
-    #[serde(default)]
-    pub metadata: serde_json::Value,
-}
-
 /// A search result from Milvus.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SearchHit {
@@ -214,12 +200,15 @@ impl MilvusClient {
     pub fn new(base_url: &str, token: Option<String>) -> Self {
         let mut headers = reqwest::header::HeaderMap::new();
         if let Some(ref token) = token {
-            headers.insert(
-                reqwest::header::AUTHORIZATION,
-                format!("Bearer {}", token)
-                    .parse()
-                    .expect("valid header value"),
-            );
+            match format!("Bearer {}", token).parse::<reqwest::header::HeaderValue>() {
+                Ok(mut value) => {
+                    value.set_sensitive(true);
+                    headers.insert(reqwest::header::AUTHORIZATION, value);
+                }
+                Err(_) => warn!(
+                    "MILVUS_TOKEN is not a valid HTTP header value; sending unauthenticated requests"
+                ),
+            }
         }
 
         let client = Client::builder()
@@ -315,53 +304,6 @@ impl MilvusClient {
         }
 
         Ok(response.data.map(|d| d.has).unwrap_or(false))
-    }
-
-    /// Insert documents into a collection.
-    pub async fn insert(&self, collection: &str, docs: Vec<Document>) -> Result<()> {
-        if docs.is_empty() {
-            return Ok(());
-        }
-
-        let url = format!("{}/v2/vectordb/entities/insert", self.base_url);
-
-        let data: Vec<InsertRow> = docs
-            .into_iter()
-            .map(|doc| InsertRow {
-                id: milvus_id_for_chunk_id(&doc.id),
-                content: doc.content,
-                vector: doc.vector,
-                metadata: doc.metadata,
-            })
-            .collect();
-
-        let request = InsertRequest {
-            db_name: "default".to_string(),
-            collection_name: collection.to_string(),
-            data,
-        };
-
-        let response: MilvusResponse = self
-            .client
-            .post(&url)
-            .json(&request)
-            .send()
-            .await
-            .context("failed to send insert request")?
-            .json()
-            .await
-            .context("failed to parse insert response")?;
-
-        if response.code != 0 {
-            anyhow::bail!(
-                "insert failed: {}",
-                response
-                    .message
-                    .unwrap_or_else(|| "unknown error".to_string())
-            );
-        }
-
-        Ok(())
     }
 
     /// Search for similar vectors in a collection.
@@ -715,6 +657,19 @@ impl SearchResultsData {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn search_response_accepts_nested_results() {
+        let response: super::SearchResponse = serde_json::from_value(serde_json::json!({
+            "code": 0,
+            "data": [[
+                { "id": 123, "distance": 0.5, "content": "hello", "metadata": {} }
+            ]]
+        }))
+        .unwrap();
+
+        assert_eq!(response.data.unwrap().into_hits().len(), 1);
+    }
+
     use super::{milvus_id_for_chunk_id, SearchResponse};
 
     #[test]

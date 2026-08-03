@@ -6,12 +6,12 @@ pub use local::{ChunkMeta, CollectionStats, InsertRow, LocalStore, SearchHit};
 
 pub(crate) use client::milvus_id_for_chunk_id;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::env;
 use std::path::Path;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::config::Config;
 
@@ -83,14 +83,17 @@ impl VectorStore {
             Self::Milvus(client) => {
                 let rows: Vec<client::InsertRow> = data
                     .iter()
-                    .map(|row| client::InsertRow {
-                        id: milvus_id_for_chunk_id(&row.id),
-                        content: row.content.clone(),
-                        vector: row.vector.clone(),
-                        metadata: serde_json::to_value(&row.metadata)
-                            .expect("chunk metadata must serialize"),
+                    .map(|row| {
+                        Ok(client::InsertRow {
+                            id: milvus_id_for_chunk_id(&row.id),
+                            content: row.content.clone(),
+                            vector: row.vector.clone(),
+                            metadata: serde_json::to_value(&row.metadata).with_context(|| {
+                                format!("chunk metadata for {} must serialize", row.id)
+                            })?,
+                        })
                     })
-                    .collect();
+                    .collect::<Result<_>>()?;
                 client.insert_batch(collection, &rows).await
             }
         }
@@ -109,11 +112,23 @@ impl VectorStore {
                 let hits = client.search(collection, vector, top_k).await?;
                 Ok(hits
                     .into_iter()
-                    .map(|hit| SearchHit {
-                        id: hit.id,
-                        score: hit.score,
-                        content: hit.content,
-                        metadata: serde_json::from_value(hit.metadata).unwrap_or_default(),
+                    .map(|hit| {
+                        let metadata = serde_json::from_value(hit.metadata).unwrap_or_else(|e| {
+                            warn!(
+                                collection,
+                                hit_id = %hit.id,
+                                error = %e,
+                                "Milvus metadata does not match the shared ChunkMeta layout; \
+                                 result paths will be empty"
+                            );
+                            ChunkMeta::default()
+                        });
+                        SearchHit {
+                            id: hit.id,
+                            score: hit.score,
+                            content: hit.content,
+                            metadata,
+                        }
                     })
                     .collect())
             }
@@ -200,7 +215,18 @@ fn scoped_collection_identity(
     let root = Path::new(root)
         .canonicalize()
         .unwrap_or_else(|_| Path::new(root).to_path_buf());
-    let relative = path.strip_prefix(root).ok()?;
+    let relative = match path.strip_prefix(&root) {
+        Ok(relative) => relative,
+        Err(_) => {
+            warn!(
+                path = %path.display(),
+                root = %root.display(),
+                "path is outside SINDEXER_COLLECTION_ROOT; collection identity does not apply \
+                 and the collection name falls back to hashing the absolute path"
+            );
+            return None;
+        }
+    };
 
     if relative.as_os_str().is_empty() {
         Some(identity.to_string())

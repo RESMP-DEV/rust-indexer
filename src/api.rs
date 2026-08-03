@@ -255,14 +255,24 @@ impl Indexer {
 
         Ok(fused
             .into_iter()
-            .map(|hit| SearchHit {
-                file_path: hit.chunk.file_path,
-                relative_path: hit.chunk.relative_path,
-                content: hit.chunk.content,
-                start_line: hit.chunk.start_line,
-                end_line: hit.chunk.end_line,
-                language: hit.chunk.language,
-                score: hit.score,
+            .map(|hit| {
+                // Semantic hits carry the absolute path recorded by whichever
+                // host indexed them; rebuild from the local checkout so shared
+                // (identity-scoped) collections resolve to real local files.
+                let file_path = if hit.chunk.relative_path.is_empty() {
+                    hit.chunk.file_path
+                } else {
+                    path.join(&hit.chunk.relative_path)
+                };
+                SearchHit {
+                    file_path,
+                    relative_path: hit.chunk.relative_path,
+                    content: hit.chunk.content,
+                    start_line: hit.chunk.start_line,
+                    end_line: hit.chunk.end_line,
+                    language: hit.chunk.language,
+                    score: hit.score,
+                }
             })
             .collect())
     }

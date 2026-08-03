@@ -2,24 +2,33 @@
 
 ## Unreleased
 
-- Share one index with rust_sindexer: restored the Milvus/Zilliz backend and
-  identity-scoped collection naming (`SINDEXER_COLLECTION_IDENTITY` /
-  `SINDEXER_COLLECTION_ROOT`), moved the manifest back to `<repo>/.sindexer/`
-  and the lexical cache back to `$XDG_CACHE_HOME/sindexer/`, and restored the
-  Milvus i64 id canonicalization in hybrid fusion. An index built by the MCP
-  server is searchable and updatable from this CLI and vice versa.
-- Auto-load `~/.context/.env` (existing environment wins) so the CLI sees the
-  same embedding and Milvus configuration as the sindexer wrapper script.
-- Initial fork from rust_sindexer (MCP server variant) as a standalone CLI.
-- Removed the MCP protocol surface (rmcp) and the Milvus/Zilliz vector
-  backend; the local store is now the only vector backend.
-- Replaced JSON vector persistence with bincode and a typed `ChunkMeta`
-  (serde_json::Value cannot round-trip through bincode), making cold-start
-  collection loads ~1ms at 500-chunk scale.
-- Added clap subcommands: `index`, `update`, `search`, `status`, `clear`,
-  `collections`, each with `--json` output.
-- Renamed on-disk locations: repo manifest in `.rust-indexer/`, caches under
-  `$XDG_CACHE_HOME/rust-indexer/`.
-- Simplified collection identity to path-hash naming; removed the
-  cross-host `SINDEXER_COLLECTION_IDENTITY`/`SINDEXER_COLLECTION_ROOT`
-  machinery and `MILVUS_*` configuration.
+- Initial fork from rust_sindexer (MCP server variant) as a standalone CLI
+  with clap subcommands `index`, `update`, `search`, `status`, `clear`, and
+  `collections`, each supporting `--json` output. The MCP protocol surface
+  (rmcp) is removed.
+- Index compatibility with rust_sindexer is preserved: identical collection
+  naming (including `SINDEXER_COLLECTION_IDENTITY` / `SINDEXER_COLLECTION_ROOT`
+  scoping), the shared `<repo>/.sindexer/` manifest, the shared tantivy
+  lexical cache, the same Milvus metadata layout, and Milvus i64 id
+  canonicalization in hybrid fusion. When both tools use the Milvus/Zilliz
+  backend, an index built by the MCP server is searchable and incrementally
+  updatable from this CLI and vice versa; lexical indexes are shared in all
+  modes.
+- The local (no `MILVUS_URL`) vector store is the one non-shared surface: it
+  persists bincode with a typed `ChunkMeta` because `serde_json::Value`
+  cannot round-trip through bincode, while rust_sindexer's local store uses
+  JSON. Cold-start collection loads are ~1ms at 500-chunk scale.
+- `~/.context/.env` is loaded automatically (existing environment wins) so
+  the CLI sees the same embedding and Milvus configuration as the sindexer
+  wrapper script.
+- Review hardening (PR #1): the env-file loader strips both quote styles and
+  rejects NUL bytes and unbalanced quotes; Milvus auth-header construction
+  no longer panics on invalid tokens and marks the header sensitive; chunk
+  metadata serialization errors propagate instead of panicking; metadata
+  layout mismatches on search log a warning instead of silently returning
+  empty paths; a discarded collection identity (path outside
+  `SINDEXER_COLLECTION_ROOT`) logs a warning; incremental `update` fails
+  fast when the lexical cache is missing instead of creating a fresh one;
+  search results rebuild `file_path` from the local checkout root so
+  identity-scoped collections shared across hosts resolve to local files;
+  the unused Milvus `Document`/`insert` API was removed.

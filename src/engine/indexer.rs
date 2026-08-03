@@ -135,6 +135,17 @@ async fn run_index_codebase(
 
     info!("Starting codebase indexing at {}", path.display());
 
+    if incremental_only
+        && state.manifest_store.load(path).ok().flatten().is_some()
+        && !LexicalIndex::exists(path).unwrap_or(false)
+    {
+        update_status_failed(state, path).await;
+        anyhow::bail!(
+            "Incremental update requires an existing lexical index for {}; run index --force to rebuild",
+            path.display()
+        );
+    }
+
     let collection_name = collection_name_from_path(path);
     let index_inputs = IndexInputs::from_splitter_and_walker(
         state.splitter.config(),
@@ -1187,6 +1198,28 @@ mod tests {
         assert!(err
             .to_string()
             .contains("Incremental update requires an existing index manifest"));
+        assert_eq!(state.get_status().await.status, IndexState::Failed);
+    }
+
+    #[tokio::test]
+    async fn test_incremental_update_requires_existing_lexical_index() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let cache_dir = TempDir::new().unwrap();
+        let _cache_lock = set_test_cache_dir_async(cache_dir.path()).await;
+        fs::write(root.join("main.py"), "def add(a, b):\n    return a + b\n").unwrap();
+
+        let state = make_lexical_indexer_state(root);
+        index_codebase(&state, root, false).await.unwrap();
+
+        // Simulate a lost lexical cache (manifest still present in the repo).
+        let other_cache = TempDir::new().unwrap();
+        std::env::set_var("XDG_CACHE_HOME", other_cache.path());
+
+        let err = update_codebase_index(&state, root).await.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Incremental update requires an existing lexical index"));
         assert_eq!(state.get_status().await.status, IndexState::Failed);
     }
 
