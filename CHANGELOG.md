@@ -15,7 +15,9 @@
   backend-mismatch safeguards; search treats such errors like a mismatch
   (semantic skipped, lexical served); a malformed persisted status file
   fails the run (file preserved for inspection) instead of reading as
-  zero vector evidence.
+  zero vector evidence; and a provenance-record write failure now rolls
+  back the manifest written in the same run, so an unauthenticated fresh
+  manifest cannot let a stale same-named backend be adopted as current.
 - The Milvus client maps the collection-not-found response (code 100) to an
   empty semantic result set directly, removing the per-search existence
   round trip, and warns when only one of `SINDEXER_COLLECTION_IDENTITY` /

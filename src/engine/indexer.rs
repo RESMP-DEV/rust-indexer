@@ -339,18 +339,13 @@ async fn run_index_codebase(
                     )
                     .await;
                     if embeddings_enabled {
-                        if let Err(e) = state
-                            .manifest_store
-                            .write_backend(path, &state.vector_store.provenance())
-                        {
-                            update_status_failed(
-                                state,
-                                path,
-                                previous_status_before_index.as_ref(),
-                            )
-                            .await;
-                            return Err(e).context("Failed to record vector backend provenance");
-                        }
+                        record_backend_or_rollback(
+                            state,
+                            path,
+                            previous_status_before_index.as_ref(),
+                            false,
+                        )
+                        .await?;
                     }
                     return Ok(IndexResult {
                         files_processed: 0,
@@ -492,18 +487,13 @@ async fn run_index_codebase(
             0
         };
         if embeddings_enabled {
-            if let Err(e) = state
-                .manifest_store
-                .write_backend(path, &state.vector_store.provenance())
-            {
-                update_status_failed(
-                    state,
-                    path,
-                    failure_evidence(full_reindex, previous_status_before_index.as_ref()),
-                )
-                .await;
-                return Err(e).context("Failed to record vector backend provenance");
-            }
+            record_backend_or_rollback(
+                state,
+                path,
+                failure_evidence(full_reindex, previous_status_before_index.as_ref()),
+                true,
+            )
+            .await?;
         }
         {
             let mut status = state.indexing_status.write().await;
@@ -804,18 +794,13 @@ async fn run_index_codebase(
     }
 
     if embeddings_enabled {
-        if let Err(e) = state
-            .manifest_store
-            .write_backend(path, &state.vector_store.provenance())
-        {
-            update_status_failed(
-                state,
-                path,
-                failure_evidence(full_reindex, previous_status_before_index.as_ref()),
-            )
-            .await;
-            return Err(e).context("Failed to record vector backend provenance");
-        }
+        record_backend_or_rollback(
+            state,
+            path,
+            failure_evidence(full_reindex, previous_status_before_index.as_ref()),
+            true,
+        )
+        .await?;
     }
     {
         let mut status = state.indexing_status.write().await;
@@ -951,6 +936,32 @@ fn split_or_skip_embedding_batch(
     let right = batch.split_off(batch.len() / 2);
     pending.push(right);
     pending.push(batch);
+}
+
+/// Persist the backend provenance record; on failure, roll back so no
+/// unauthenticated state survives: the possibly-partial sidecar is removed,
+/// and if this run just rewrote the manifest, the manifest goes too (a
+/// missing manifest forces full revalidation next run, which is safe; a new
+/// manifest without an authenticating record would let a stale same-named
+/// backend be adopted as current).
+async fn record_backend_or_rollback(
+    state: &IndexerState,
+    path: &Path,
+    prior_evidence: Option<&IndexStatus>,
+    manifest_written_this_run: bool,
+) -> Result<()> {
+    if let Err(e) = state
+        .manifest_store
+        .write_backend(path, &state.vector_store.provenance())
+    {
+        let _ = state.manifest_store.clear_backend(path);
+        if manifest_written_this_run {
+            let _ = state.manifest_store.clear_manifest(path);
+        }
+        update_status_failed(state, path, prior_evidence).await;
+        return Err(e).context("Failed to record vector backend provenance");
+    }
+    Ok(())
 }
 
 /// Evidence to preserve on failure: the pre-run status, unless this run
@@ -2332,6 +2343,9 @@ mod tests {
         let err = index_codebase(&state, root, false).await.unwrap_err();
         assert!(format!("{err:#}").contains("provenance"));
         assert_eq!(state.get_status().await.status, IndexState::Failed);
+        // The manifest written this run is rolled back: without an
+        // authenticating record it must not survive to validate anything.
+        assert!(ManifestStore.load(root).unwrap().is_none());
         embedding.wait().await;
     }
 
