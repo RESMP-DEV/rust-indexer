@@ -109,6 +109,13 @@ impl VectorStore {
         match self {
             Self::Local(store) => store.search(collection, vector, top_k),
             Self::Milvus(client) => {
+                // A repo may only have a lexical index (indexed without
+                // embeddings); mirror the local store and return an empty
+                // semantic result instead of failing the whole search.
+                if !client.has_collection(collection).await? {
+                    debug!(collection, "Milvus collection missing; semantic hits empty");
+                    return Ok(Vec::new());
+                }
                 let hits = client.search(collection, vector, top_k).await?;
                 Ok(hits
                     .into_iter()

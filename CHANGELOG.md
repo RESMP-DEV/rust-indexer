@@ -44,4 +44,8 @@
   updating vectors would permanently hide semantic staleness from both
   tools. Runs refused before any index mutation restore the pre-run
   persisted status instead of zeroing it, so the recorded vector evidence
-  survives repeated refusals.
+  survives repeated refusals; the API layer and status mirror no longer
+  persist status at all (the engine is the sole owner of the on-disk
+  status file); and hybrid search with a configured Milvus backend now
+  returns empty semantic results for a missing collection instead of
+  failing, so lexical-only indexes stay searchable.

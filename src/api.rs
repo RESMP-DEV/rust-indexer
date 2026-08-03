@@ -120,7 +120,11 @@ impl Indexer {
         let start = Instant::now();
 
         let indexer_state = create_indexer_state(&self.state, path);
-        self.state.set_status(
+        // In-memory only: the engine owns the persisted status. Writing a
+        // zeroed status to disk here would destroy the previous run's record
+        // (e.g. the vector count guarding lexical-only runs) before the
+        // engine can read it.
+        self.state.indexing_status.insert(
             path.to_path_buf(),
             IndexStatus {
                 status: IndexState::Indexing,
@@ -134,8 +138,16 @@ impl Indexer {
         let status_mirror = tokio::spawn(async move {
             loop {
                 let status = is_clone.get_status().await;
-                let done = !matches!(status.status, IndexState::Indexing);
-                state_for_mirror.set_status(path_clone.clone(), status);
+                let done = matches!(status.status, IndexState::Completed | IndexState::Failed);
+                // Skip the engine's initial Idle so we never clobber the
+                // Indexing marker set above, and stay in-memory: persisting
+                // here would overwrite the engine's own status writes (a
+                // refused run deliberately restores the pre-run file).
+                if status.status != IndexState::Idle {
+                    state_for_mirror
+                        .indexing_status
+                        .insert(path_clone.clone(), status);
+                }
                 if done {
                     break;
                 }

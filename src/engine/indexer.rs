@@ -1632,6 +1632,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_api_run_preserves_remote_vector_evidence() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let cache_dir = TempDir::new().unwrap();
+        let _cache_lock = set_test_cache_dir_async(cache_dir.path()).await;
+        fs::write(root.join("main.py"), "def add(a, b):\n    return a + b\n").unwrap();
+
+        let recorded = IndexStatus {
+            total_files: 1,
+            processed_files: 1,
+            total_chunks: 3,
+            embeddings_generated: 3,
+            vectors_inserted: 3,
+            status: IndexState::Completed,
+        };
+        ManifestStore.write_status(root, &recorded).unwrap();
+
+        // Full API path (not just the engine): Indexer::index must refuse the
+        // lexical-only run and must not destroy the persisted vector count.
+        let api = crate::api::Indexer::with_components(
+            Config::default(),
+            Embedder::Disabled,
+            VectorStore::Local(crate::vectordb::LocalStore::new()),
+        );
+        for _ in 0..2 {
+            let err = api.index(root, false).await.unwrap_err();
+            assert!(format!("{err:#}").contains("embeddings are disabled"));
+        }
+        let persisted = ManifestStore.load_status(root).unwrap().unwrap();
+        assert_eq!(persisted.vectors_inserted, 3);
+        assert_eq!(persisted.status, IndexState::Completed);
+    }
+
+    #[tokio::test]
+    async fn test_milvus_search_missing_collection_returns_empty() {
+        let milvus = spawn_mock_json_server(HashMap::from([(
+            "/v2/vectordb/collections/has",
+            serde_json::json!({"code": 0, "data": {"has": false}}),
+        )]))
+        .await;
+        let store = VectorStore::Milvus(crate::vectordb::MilvusClient::new(&milvus.base_url, None));
+
+        let hits = store.search("missing", &[0.1, 0.2], 5).await.unwrap();
+        assert!(hits.is_empty());
+        milvus.wait().await;
+    }
+
+    #[tokio::test]
     async fn test_lexical_only_indexing() {
         let temp_dir = TempDir::new().unwrap();
         let root = temp_dir.path();
