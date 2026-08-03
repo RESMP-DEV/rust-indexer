@@ -48,4 +48,8 @@
   persist status at all (the engine is the sole owner of the on-disk
   status file); and hybrid search with a configured Milvus backend now
   returns empty semantic results for a missing collection instead of
-  failing, so lexical-only indexes stay searchable.
+  failing, so lexical-only indexes stay searchable; and \`clear\` refuses to delete
+  the shared manifest, status, and lexical index while the recorded status
+  shows vectors in a backend the current environment cannot see, since the
+  surviving remote collection plus a rebuilt manifest would present stale
+  semantic results as current.

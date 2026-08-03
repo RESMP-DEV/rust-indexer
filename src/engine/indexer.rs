@@ -1680,6 +1680,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_clear_refuses_when_recorded_vectors_are_invisible() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let cache_dir = TempDir::new().unwrap();
+        let _cache_lock = set_test_cache_dir_async(cache_dir.path()).await;
+
+        ManifestStore
+            .write_status(
+                root,
+                &IndexStatus {
+                    total_files: 1,
+                    processed_files: 1,
+                    total_chunks: 3,
+                    embeddings_generated: 3,
+                    vectors_inserted: 3,
+                    status: IndexState::Completed,
+                },
+            )
+            .unwrap();
+
+        // No collection visible to the configured (local) backend: refuse.
+        let api = crate::api::Indexer::with_components(
+            Config::default(),
+            Embedder::Disabled,
+            VectorStore::Local(crate::vectordb::LocalStore::new()),
+        );
+        let err = api.clear(root).await.unwrap_err();
+        assert!(format!("{err:#}").contains("cannot"));
+        assert_eq!(
+            ManifestStore
+                .load_status(root)
+                .unwrap()
+                .unwrap()
+                .vectors_inserted,
+            3
+        );
+
+        // Once the backend can see (and drop) the collection, clear works.
+        let collection = collection_name_from_path(root);
+        let local = crate::vectordb::LocalStore::new();
+        local.create_collection(&collection, 4).unwrap();
+        api.clear(root).await.unwrap();
+        assert!(ManifestStore.load_status(root).unwrap().is_none());
+        // Fresh store instance: the old one still caches the collection in
+        // memory; the on-disk file is what clear must have removed.
+        assert!(!crate::vectordb::LocalStore::new()
+            .has_collection(&collection)
+            .unwrap());
+    }
+
+    #[tokio::test]
     async fn test_lexical_only_indexing() {
         let temp_dir = TempDir::new().unwrap();
         let root = temp_dir.path();

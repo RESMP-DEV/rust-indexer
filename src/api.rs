@@ -317,6 +317,29 @@ impl Indexer {
             .vector_store
             .has_collection(&collection_name)
             .await?;
+        // Clearing must not destroy the durable evidence of vectors held in
+        // a backend this environment cannot see (e.g. Milvus without
+        // MILVUS_URL): the surviving remote collection plus a later rebuilt
+        // compatible manifest would present stale semantic results as
+        // current.
+        let recorded_vectors = self
+            .state
+            .manifest_store
+            .load_status(path)
+            .ok()
+            .flatten()
+            .map(|status| status.vectors_inserted > 0)
+            .unwrap_or(false);
+        if recorded_vectors && !had_vector {
+            bail!(
+                "The recorded index for {} has vectors in a backend this environment cannot \
+                 see (e.g. Milvus without MILVUS_URL set); configure that backend so clear can \
+                 drop the collection, or remove {}/.sindexer/ manually if the vectors are \
+                 already gone",
+                path.display(),
+                path.display()
+            );
+        }
         if had_vector {
             self.state
                 .vector_store
