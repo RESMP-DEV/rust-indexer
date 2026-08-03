@@ -69,4 +69,7 @@
   never described; an absent or unauthenticated record adopts the current
   backend, which is the required behavior for sindexer-built indexes.
   Fully closing the backend flip-flop window would need rust_sindexer to
-  write the same provenance record (lockstep follow-up).
+  write the same provenance record (lockstep follow-up). `search` also
+  consults the record: on an authenticated mismatch it skips semantic
+  retrieval with a warning instead of fusing stale vectors, while lexical
+  results continue to serve.

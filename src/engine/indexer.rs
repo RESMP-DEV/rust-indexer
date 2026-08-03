@@ -2074,6 +2074,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_search_skips_semantic_on_backend_mismatch() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let cache_dir = TempDir::new().unwrap();
+        let _cache_lock = set_test_cache_dir_async(cache_dir.path()).await;
+        fs::write(root.join("main.py"), "def add(a, b):\n    return a + b\n").unwrap();
+
+        ManifestStore
+            .write_for_files(
+                root,
+                "collection",
+                &IndexInputs {
+                    chunk_size: 512,
+                    overlap_lines: 3,
+                    min_chunk_lines: 5,
+                    target_chunk_lines: 50,
+                    extensions: vec!["py".into()],
+                    ignore_patterns: vec![],
+                    max_file_size: 1024 * 1024,
+                    follow_symlinks: false,
+                    embedding_passage_prefix_sha256: String::new(),
+                },
+                &[root.join("main.py")],
+            )
+            .unwrap();
+        ManifestStore
+            .write_backend(root, "milvus http://elsewhere:19530")
+            .unwrap();
+
+        // Embedder points at a dead endpoint: if the semantic path ran, the
+        // search would fail. The provenance mismatch must skip it instead.
+        let api = crate::api::Indexer::with_components(
+            Config::default(),
+            Embedder::Http(EmbeddingClient::new(EmbeddingConfig {
+                url: "http://127.0.0.1:9/v1/embeddings".to_string(),
+                model: "test".to_string(),
+                batch_size: 100,
+                api_key: None,
+                query_prefix: String::new(),
+                passage_prefix: String::new(),
+            })),
+            VectorStore::Local(crate::vectordb::LocalStore::new()),
+        );
+        let hits = api.search(root, "add", 5, &[]).await.unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[tokio::test]
     async fn test_lexical_only_indexing() {
         let temp_dir = TempDir::new().unwrap();
         let root = temp_dir.path();

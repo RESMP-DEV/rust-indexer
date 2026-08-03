@@ -218,8 +218,30 @@ impl Indexer {
 
         let collection = collection_name_from_path(path);
 
+        // Semantic hits are only trustworthy if the configured backend is
+        // the one the recorded index was built against; after a re-home, a
+        // surviving same-named collection in the old backend would fuse
+        // stale vectors into current results. Lexical retrieval stays valid
+        // either way, so skip semantic instead of failing the search.
+        let provenance_ok = match self.state.manifest_store.load_backend(path) {
+            Ok(Some(recorded)) => {
+                let current = self.state.vector_store.provenance();
+                if recorded == current {
+                    true
+                } else {
+                    warn!(
+                        recorded_backend = %recorded,
+                        current_backend = %current,
+                        "Vector backend differs from the recorded index; skipping semantic hits"
+                    );
+                    false
+                }
+            }
+            _ => true,
+        };
+
         let semantic_start = Instant::now();
-        let vector_hits = if self.state.embedder.is_enabled() {
+        let vector_hits = if provenance_ok && self.state.embedder.is_enabled() {
             let hits = self.state.search(&collection, query, limit).await?;
             debug!(
                 count = hits.len(),
