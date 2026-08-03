@@ -300,10 +300,18 @@ fn collection_name_from_path_with_identity(path: &Path, identity: Option<&str>) 
         sanitized
     };
 
-    // Truncate prefix if needed to fit within 255 chars with hash
+    // Truncate prefix if needed to fit within 255 chars with hash.
+    // Char-boundary-safe: identical to byte slicing for today's ASCII-only
+    // sanitization (so names stay byte-compatible with rust_sindexer), but
+    // cannot panic if the sanitization map ever admits multi-byte chars.
     let max_prefix_len = 255 - 1 - hash_prefix.len(); // 1 for underscore separator
     let prefix_part = if sanitized.len() > max_prefix_len {
-        &sanitized[..max_prefix_len]
+        let end = sanitized
+            .char_indices()
+            .nth(max_prefix_len)
+            .map(|(i, _)| i)
+            .unwrap_or(sanitized.len());
+        &sanitized[..end]
     } else {
         &sanitized
     };
