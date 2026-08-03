@@ -14,8 +14,9 @@
   round trip, and warns when only one of `SINDEXER_COLLECTION_IDENTITY` /
   `SINDEXER_COLLECTION_ROOT` is set. Provenance-record writes must succeed
   for an embeddings-enabled run to report success, and Milvus URLs are
-  normalized (trailing slashes stripped) before being stored or compared
-  as backend identities.
+  normalized (trailing slashes stripped) at client construction, keeping
+  request URLs free of double slashes and backend identities
+  slash-insensitive.
 
 - Initial fork from rust_sindexer (MCP server variant) as a standalone CLI
   with clap subcommands `index`, `update`, `search`, `status`, `clear`, and

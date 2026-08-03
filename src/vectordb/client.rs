@@ -225,7 +225,9 @@ impl MilvusClient {
 
         Self {
             client,
-            base_url: base_url.to_string(),
+            // Normalized at construction so request URLs never contain
+            // "//v2/..." and provenance identities are slash-insensitive.
+            base_url: base_url.trim_end_matches('/').to_string(),
         }
     }
 
@@ -673,6 +675,12 @@ impl SearchResultsData {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn base_url_trailing_slash_is_normalized() {
+        let client = super::MilvusClient::new("http://localhost:19530/", None);
+        assert_eq!(client.base_url(), "http://localhost:19530");
+    }
+
     #[test]
     fn insert_response_accepts_upsert_count() {
         let response: super::InsertResponse = serde_json::from_value(serde_json::json!({

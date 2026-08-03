@@ -45,9 +45,8 @@ impl VectorStore {
     pub fn provenance(&self) -> String {
         match self {
             Self::Local(_) => "local".to_string(),
-            // Normalize so `https://host` and `https://host/` read as the
-            // same backend identity.
-            Self::Milvus(client) => format!("milvus {}", client.base_url().trim_end_matches('/')),
+            // base_url is normalized at client construction.
+            Self::Milvus(client) => format!("milvus {}", client.base_url()),
         }
     }
 
