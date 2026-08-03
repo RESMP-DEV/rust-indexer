@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
-use reqwest::header::{HeaderMap, AUTHORIZATION};
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
@@ -198,19 +198,18 @@ pub struct EmbeddingClient {
 
 impl EmbeddingClient {
     /// Creates a new embedding client with the given configuration.
-    pub fn new(config: EmbeddingConfig) -> Self {
+    pub fn new(config: EmbeddingConfig) -> Result<Self> {
         Self::with_rate_limiter(config, RateLimiter::unlimited())
     }
 
-    pub fn with_rate_limiter(config: EmbeddingConfig, rate_limiter: RateLimiter) -> Self {
+    pub fn with_rate_limiter(config: EmbeddingConfig, rate_limiter: RateLimiter) -> Result<Self> {
         let mut headers = HeaderMap::new();
         if let Some(ref key) = config.api_key {
-            headers.insert(
-                AUTHORIZATION,
-                format!("Bearer {}", key)
-                    .parse()
-                    .expect("valid header value"),
-            );
+            let mut auth_value: HeaderValue = format!("Bearer {}", key)
+                .parse()
+                .context("invalid API key: cannot encode as HTTP header value")?;
+            auth_value.set_sensitive(true);
+            headers.insert(AUTHORIZATION, auth_value);
         }
 
         let client = Client::builder()
@@ -219,17 +218,17 @@ impl EmbeddingClient {
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(120))
             .build()
-            .expect("failed to build HTTP client");
+            .context("failed to build HTTP client")?;
 
-        Self {
+        Ok(Self {
             client,
             config,
             rate_limiter,
-        }
+        })
     }
 
     /// Creates a new embedding client with default configuration.
-    pub fn with_defaults() -> Self {
+    pub fn with_defaults() -> Result<Self> {
         Self::new(EmbeddingConfig::default())
     }
 
@@ -570,7 +569,8 @@ mod tests {
             query_prefix: "query:\n".into(),
             passage_prefix: "passage:\n".into(),
             ..EmbeddingConfig::default()
-        });
+        })
+        .unwrap();
         prefixed.embed("needle").await.unwrap();
         prefixed
             .embed_batch(&["alpha".into(), "beta".into()])
@@ -581,7 +581,8 @@ mod tests {
             url: endpoint,
             model: "test-model".into(),
             ..EmbeddingConfig::default()
-        });
+        })
+        .unwrap();
         unprefixed.embed_batch(&["plain".into()]).await.unwrap();
 
         let bodies = server.await.unwrap().unwrap();

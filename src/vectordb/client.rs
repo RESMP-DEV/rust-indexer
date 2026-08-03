@@ -451,7 +451,7 @@ impl MilvusClient {
         );
         let start = std::time::Instant::now();
         const MAX_RETRIES: u32 = 3;
-        let url = format!("{}/v2/vectordb/entities/insert", self.base_url);
+        let url = format!("{}/v2/vectordb/entities/upsert", self.base_url);
 
         let request_body = InsertRequest {
             db_name: "default".to_string(),

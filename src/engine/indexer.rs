@@ -1357,14 +1357,17 @@ mod tests {
                 overlap_lines: Config::default().chunk_overlap / 80,
                 ..SplitterConfig::default()
             }),
-            Embedder::Http(EmbeddingClient::new(EmbeddingConfig {
-                url: format!("{}/v1/embeddings", embedding_url),
-                model: "test".to_string(),
-                batch_size: 100,
-                api_key: None,
-                query_prefix: String::new(),
-                passage_prefix: String::new(),
-            })),
+            Embedder::Http(
+                EmbeddingClient::new(EmbeddingConfig {
+                    url: format!("{}/v1/embeddings", embedding_url),
+                    model: "test".to_string(),
+                    batch_size: 100,
+                    api_key: None,
+                    query_prefix: String::new(),
+                    passage_prefix: String::new(),
+                })
+                .unwrap(),
+            ),
             VectorStore::Local(crate::vectordb::LocalStore::new()),
             dimension,
         )
@@ -1613,7 +1616,7 @@ mod tests {
                 serde_json::json!({"code": 0}),
             ),
             (
-                "/v2/vectordb/entities/insert",
+                "/v2/vectordb/entities/upsert",
                 serde_json::json!({"code": 0}),
             ),
             (
@@ -1631,14 +1634,17 @@ mod tests {
                 overlap_lines: Config::default().chunk_overlap / 80,
                 ..SplitterConfig::default()
             }),
-            Embedder::Http(EmbeddingClient::new(EmbeddingConfig {
-                url: format!("{}/v1/embeddings", embedding.base_url),
-                model: "test".to_string(),
-                batch_size: 100,
-                api_key: None,
-                query_prefix: String::new(),
-                passage_prefix: String::new(),
-            })),
+            Embedder::Http(
+                EmbeddingClient::new(EmbeddingConfig {
+                    url: format!("{}/v1/embeddings", embedding.base_url),
+                    model: "test".to_string(),
+                    batch_size: 100,
+                    api_key: None,
+                    query_prefix: String::new(),
+                    passage_prefix: String::new(),
+                })
+                .unwrap(),
+            ),
             VectorStore::Milvus(crate::vectordb::MilvusClient::new(&healthy.base_url, None)),
             4,
         );
@@ -1659,14 +1665,17 @@ mod tests {
                 overlap_lines: Config::default().chunk_overlap / 80,
                 ..SplitterConfig::default()
             }),
-            Embedder::Http(EmbeddingClient::new(EmbeddingConfig {
-                url: format!("{}/v1/embeddings", embedding.base_url),
-                model: "test".to_string(),
-                batch_size: 100,
-                api_key: None,
-                query_prefix: String::new(),
-                passage_prefix: String::new(),
-            })),
+            Embedder::Http(
+                EmbeddingClient::new(EmbeddingConfig {
+                    url: format!("{}/v1/embeddings", embedding.base_url),
+                    model: "test".to_string(),
+                    batch_size: 100,
+                    api_key: None,
+                    query_prefix: String::new(),
+                    passage_prefix: String::new(),
+                })
+                .unwrap(),
+            ),
             VectorStore::Milvus(crate::vectordb::MilvusClient::new(&broken.base_url, None)),
             4,
         );
@@ -1897,7 +1906,7 @@ mod tests {
                 serde_json::json!({"code": 0}),
             ),
             (
-                "/v2/vectordb/entities/insert",
+                "/v2/vectordb/entities/upsert",
                 serde_json::json!({"code": 0}),
             ),
             (
@@ -1920,14 +1929,17 @@ mod tests {
                     overlap_lines: Config::default().chunk_overlap / 80,
                     ..SplitterConfig::default()
                 }),
-                Embedder::Http(EmbeddingClient::new(EmbeddingConfig {
-                    url: format!("{}/v1/embeddings", embedding_url),
-                    model: "test".to_string(),
-                    batch_size: 100,
-                    api_key: None,
-                    query_prefix: String::new(),
-                    passage_prefix: String::new(),
-                })),
+                Embedder::Http(
+                    EmbeddingClient::new(EmbeddingConfig {
+                        url: format!("{}/v1/embeddings", embedding_url),
+                        model: "test".to_string(),
+                        batch_size: 100,
+                        api_key: None,
+                        query_prefix: String::new(),
+                        passage_prefix: String::new(),
+                    })
+                    .unwrap(),
+                ),
                 VectorStore::Milvus(crate::vectordb::MilvusClient::new(&milvus.base_url, None)),
                 4,
             )
@@ -1971,14 +1983,17 @@ mod tests {
                     overlap_lines: Config::default().chunk_overlap / 80,
                     ..SplitterConfig::default()
                 }),
-                Embedder::Http(EmbeddingClient::new(EmbeddingConfig {
-                    url: format!("{}/v1/embeddings", embedding.base_url),
-                    model: "test".to_string(),
-                    batch_size: 100,
-                    api_key: None,
-                    query_prefix: String::new(),
-                    passage_prefix: String::new(),
-                })),
+                Embedder::Http(
+                    EmbeddingClient::new(EmbeddingConfig {
+                        url: format!("{}/v1/embeddings", embedding.base_url),
+                        model: "test".to_string(),
+                        batch_size: 100,
+                        api_key: None,
+                        query_prefix: String::new(),
+                        passage_prefix: String::new(),
+                    })
+                    .unwrap(),
+                ),
                 VectorStore::Local(crate::vectordb::LocalStore::new()),
                 4,
             )
@@ -2107,14 +2122,17 @@ mod tests {
         // search would fail. The provenance mismatch must skip it instead.
         let api = crate::api::Indexer::with_components(
             Config::default(),
-            Embedder::Http(EmbeddingClient::new(EmbeddingConfig {
-                url: "http://127.0.0.1:9/v1/embeddings".to_string(),
-                model: "test".to_string(),
-                batch_size: 100,
-                api_key: None,
-                query_prefix: String::new(),
-                passage_prefix: String::new(),
-            })),
+            Embedder::Http(
+                EmbeddingClient::new(EmbeddingConfig {
+                    url: "http://127.0.0.1:9/v1/embeddings".to_string(),
+                    model: "test".to_string(),
+                    batch_size: 100,
+                    api_key: None,
+                    query_prefix: String::new(),
+                    passage_prefix: String::new(),
+                })
+                .unwrap(),
+            ),
             VectorStore::Local(crate::vectordb::LocalStore::new()),
         );
         let hits = api.search(root, "add", 5, &[]).await.unwrap();

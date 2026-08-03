@@ -126,7 +126,7 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let indexer = Indexer::from_env();
+    let indexer = Indexer::from_env()?;
 
     match cli.command {
         Command::Index { path, force } => {

@@ -50,7 +50,7 @@ pub struct Indexer {
 }
 
 impl Indexer {
-    pub fn new(config: Config) -> Self {
+    pub fn new(config: Config) -> Result<Self> {
         let embedder_mode = if config.has_embedding_url() {
             "http"
         } else {
@@ -63,12 +63,12 @@ impl Indexer {
             embedding_dimension = config.embedding_dimension,
             "Indexer initialized"
         );
-        Self {
-            state: Arc::new(ContextState::new(config)),
-        }
+        Ok(Self {
+            state: Arc::new(ContextState::new(config)?),
+        })
     }
 
-    pub fn from_env() -> Self {
+    pub fn from_env() -> Result<Self> {
         Self::new(Config::from_env())
     }
 
@@ -119,7 +119,7 @@ impl Indexer {
         info!(force, incremental_only, "Starting index operation");
         let start = Instant::now();
 
-        let indexer_state = create_indexer_state(&self.state, path);
+        let indexer_state = create_indexer_state(&self.state, path)?;
         // In-memory only: the engine owns the persisted status. Writing a
         // zeroed status to disk here would destroy the previous run's record
         // (e.g. the vector count guarding lexical-only runs) before the
@@ -472,7 +472,7 @@ fn validate_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn create_indexer_state(state: &SharedState, root_path: &Path) -> Arc<IndexerState> {
+fn create_indexer_state(state: &SharedState, root_path: &Path) -> Result<Arc<IndexerState>> {
     let config = &state.config;
     let splitter = CodeSplitter::new(SplitterConfig {
         root_path: root_path.to_path_buf(),
@@ -486,17 +486,17 @@ fn create_indexer_state(state: &SharedState, root_path: &Path) -> Arc<IndexerSta
         Embedder::Http(EmbeddingClient::with_rate_limiter(
             EmbeddingConfig::from_config(config),
             rate_limiter,
-        ))
+        )?)
     } else {
         Embedder::Disabled
     };
 
-    Arc::new(IndexerState::with_concurrency(
+    Ok(Arc::new(IndexerState::with_concurrency(
         CodeWalker::from_config(config),
         splitter,
         embedder,
         VectorStore::from_config(config),
         config.embedding_dimension,
         config.concurrency,
-    ))
+    )))
 }

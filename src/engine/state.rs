@@ -51,7 +51,7 @@ pub struct ContextState {
 }
 
 impl ContextState {
-    pub fn new(config: Config) -> Self {
+    pub fn new(config: Config) -> anyhow::Result<Self> {
         info!("initializing context state");
         let embedder = if config.has_embedding_url() {
             info!("embedding enabled via configured URL");
@@ -61,7 +61,7 @@ impl ContextState {
             Embedder::Http(EmbeddingClient::with_rate_limiter(
                 embedding_config,
                 rate_limiter,
-            ))
+            )?)
         } else {
             info!("embedding disabled (no embedding URL configured)");
             Embedder::Disabled
@@ -76,14 +76,14 @@ impl ContextState {
         };
         let splitter = CodeSplitter::new(splitter_config);
 
-        Self {
+        Ok(Self {
             config,
             embedder,
             vector_store,
             manifest_store: Arc::new(ManifestStore),
             indexing_status: DashMap::new(),
             splitter,
-        }
+        })
     }
 
     pub fn with_components(config: Config, embedder: Embedder, vector_store: VectorStore) -> Self {
@@ -104,7 +104,7 @@ impl ContextState {
         }
     }
 
-    pub fn with_defaults() -> Self {
+    pub fn with_defaults() -> anyhow::Result<Self> {
         Self::new(Config::default())
     }
 
@@ -256,8 +256,8 @@ impl ContextState {
 /// Thread-safe shared state handle.
 pub type SharedState = Arc<ContextState>;
 
-pub fn create_shared_state(config: Config) -> SharedState {
-    Arc::new(ContextState::new(config))
+pub fn create_shared_state(config: Config) -> anyhow::Result<SharedState> {
+    Ok(Arc::new(ContextState::new(config)?))
 }
 
 pub fn create_shared_state_with_components(
@@ -272,8 +272,8 @@ pub fn create_shared_state_with_components(
     ))
 }
 
-pub fn create_default_shared_state() -> SharedState {
-    Arc::new(ContextState::with_defaults())
+pub fn create_default_shared_state() -> anyhow::Result<SharedState> {
+    Ok(Arc::new(ContextState::with_defaults()?))
 }
 
 #[cfg(test)]
@@ -295,7 +295,8 @@ mod tests {
         let state = ContextState::new(Config {
             embedding_url: "https://api.jina.ai/v1".to_string(),
             ..Config::default()
-        });
+        })
+        .unwrap();
 
         assert!(state.embedder.is_enabled());
     }
@@ -305,7 +306,8 @@ mod tests {
         let state = ContextState::new(Config {
             milvus_url: "https://cluster.zillizcloud.com:443".to_string(),
             ..Config::default()
-        });
+        })
+        .unwrap();
 
         assert!(matches!(state.vector_store, VectorStore::Milvus(_)));
     }
