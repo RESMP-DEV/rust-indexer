@@ -160,13 +160,22 @@ async fn run_index_codebase(
                 return Err(e).context("Failed to check for an existing vector collection");
             }
         };
-        if has_semantic {
+        // The configured backend may not be the one holding the semantic
+        // index (e.g. MILVUS_URL unset outside the wrapper environment), so
+        // also consult the shared status file both tools persist: a recorded
+        // vector count is evidence of semantic state we cannot see.
+        let status_reports_vectors = previous_status_before_index
+            .as_ref()
+            .map(|status| status.vectors_inserted > 0)
+            .unwrap_or(false);
+        if has_semantic || status_reports_vectors {
             update_status_failed(state, path).await;
             anyhow::bail!(
-                "A semantic vector collection ({}) exists for {} but embeddings are disabled; \
-                 set EMBEDDING_URL to keep it current, or clear the index before lexical-only indexing",
-                collection_name,
-                path.display()
+                "A semantic index exists for {} (collection {} or a recorded vector count) but \
+                 embeddings are disabled; set EMBEDDING_URL (and MILVUS_URL if the vectors live \
+                 in Milvus) to keep it current, or clear the index before lexical-only indexing",
+                path.display(),
+                collection_name
             );
         }
     }
@@ -1522,6 +1531,36 @@ mod tests {
         let collection = collection_name_from_path(root);
         let local = crate::vectordb::LocalStore::new();
         local.create_collection(&collection, 4).unwrap();
+
+        let state = make_lexical_indexer_state(root);
+        let err = index_codebase(&state, root, false).await.unwrap_err();
+        assert!(err.to_string().contains("embeddings are disabled"));
+        assert_eq!(state.get_status().await.status, IndexState::Failed);
+    }
+
+    #[tokio::test]
+    async fn test_lexical_only_indexing_refuses_recorded_remote_vectors() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let cache_dir = TempDir::new().unwrap();
+        let _cache_lock = set_test_cache_dir_async(cache_dir.path()).await;
+        fs::write(root.join("main.py"), "def add(a, b):\n    return a + b\n").unwrap();
+
+        // Simulate a semantic index built elsewhere (e.g. Milvus via the MCP
+        // server): no local collection, but the shared status records vectors.
+        ManifestStore
+            .write_status(
+                root,
+                &IndexStatus {
+                    total_files: 1,
+                    processed_files: 1,
+                    total_chunks: 3,
+                    embeddings_generated: 3,
+                    vectors_inserted: 3,
+                    status: IndexState::Completed,
+                },
+            )
+            .unwrap();
 
         let state = make_lexical_indexer_state(root);
         let err = index_codebase(&state, root, false).await.unwrap_err();

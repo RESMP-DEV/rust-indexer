@@ -38,6 +38,8 @@
   existence check now mark the run failed (previously the CLI could hang
   waiting on the status mirror), with an additional terminal-status safety
   net in `Indexer::run_index`; and lexical-only runs now refuse a path whose
-  semantic vector collection exists, because refreshing the shared manifest
-  without updating vectors would permanently hide semantic staleness from
-  both tools.
+  semantic vector collection exists or the shared status file records a
+  nonzero vector count (covering vectors held in a backend the current
+  environment cannot see), because refreshing the shared manifest without
+  updating vectors would permanently hide semantic staleness from both
+  tools.
