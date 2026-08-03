@@ -496,25 +496,6 @@ fn validate_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::rebuild_local_path;
-    use std::path::{Path, PathBuf};
-
-    #[test]
-    fn rebuild_local_path_accepts_both_separators() {
-        let root = Path::new("/repo");
-        assert_eq!(
-            rebuild_local_path(root, "src/engine/mod.rs"),
-            PathBuf::from("/repo/src/engine/mod.rs")
-        );
-        assert_eq!(
-            rebuild_local_path(root, "src\\engine\\mod.rs"),
-            PathBuf::from("/repo/src/engine/mod.rs")
-        );
-    }
-}
-
 fn create_indexer_state(state: &SharedState, root_path: &Path) -> Result<Arc<IndexerState>> {
     let config = &state.config;
     let splitter = CodeSplitter::new(SplitterConfig {
@@ -542,4 +523,23 @@ fn create_indexer_state(state: &SharedState, root_path: &Path) -> Result<Arc<Ind
         config.embedding_dimension,
         config.concurrency,
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rebuild_local_path;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn rebuild_local_path_accepts_both_separators() {
+        let root = Path::new("/repo");
+        assert_eq!(
+            rebuild_local_path(root, "src/engine/mod.rs"),
+            PathBuf::from("/repo/src/engine/mod.rs")
+        );
+        assert_eq!(
+            rebuild_local_path(root, "src\\engine\\mod.rs"),
+            PathBuf::from("/repo/src/engine/mod.rs")
+        );
+    }
 }
