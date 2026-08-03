@@ -192,6 +192,33 @@ async fn run_index_codebase(
         }
     }
 
+    // A backend switch is never resolved by rebuilding here, forced or not:
+    // rebuilding advances the shared manifest while the collection in the
+    // recorded backend survives, and rust_sindexer reconnecting to that
+    // backend would then serve its stale vectors as current. Re-homing goes
+    // through `clear` with the recorded backend configured, which actually
+    // drops the old collection along with the record.
+    if embeddings_enabled {
+        let current_backend = state.vector_store.provenance();
+        match state.manifest_store.load_backend(path) {
+            Ok(Some(recorded)) if recorded != current_backend => {
+                refuse_before_mutation(state, path, previous_status_before_index.as_ref()).await;
+                anyhow::bail!(
+                    "The recorded index was built against vector backend '{}' but the current \
+                     backend is '{}'; configure the recorded backend and run clear to retire its \
+                     collection before re-indexing here",
+                    recorded,
+                    current_backend
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                refuse_before_mutation(state, path, previous_status_before_index.as_ref()).await;
+                return Err(e).context("Failed to read backend provenance record");
+            }
+        }
+    }
+
     let index_inputs = IndexInputs::from_splitter_and_walker(
         state.splitter.config(),
         &state.walker.extensions,
@@ -245,49 +272,6 @@ async fn run_index_codebase(
                 };
 
                 cached_fingerprints = Some(fingerprints);
-
-                // A compatible manifest is only trustworthy if the vectors
-                // it describes live in the currently configured backend.
-                // Same-named collections can exist in both stores (e.g.
-                // after switching MILVUS_URL), so an empty diff against the
-                // wrong backend would serve stale vectors as current.
-                if embeddings_enabled {
-                    let current_backend = state.vector_store.provenance();
-                    match state.manifest_store.load_backend(path) {
-                        Ok(Some(recorded)) if recorded != current_backend => {
-                            // Refuse rather than rebuild: a rebuild into the
-                            // currently selected backend would advance the
-                            // shared manifest, which rust_sindexer would then
-                            // trust while its vectors in the recorded backend
-                            // go stale. `index --force` remains the explicit
-                            // override for deliberately re-homing the index.
-                            refuse_before_mutation(
-                                state,
-                                path,
-                                previous_status_before_index.as_ref(),
-                            )
-                            .await;
-                            anyhow::bail!(
-                                "The recorded index was built against vector backend '{}' but the \
-                                 current backend is '{}'; configure the recorded backend, or run \
-                                 index --force only if you intend to re-home the index to the \
-                                 current backend",
-                                recorded,
-                                current_backend
-                            );
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            refuse_before_mutation(
-                                state,
-                                path,
-                                previous_status_before_index.as_ref(),
-                            )
-                            .await;
-                            return Err(e).context("Failed to read backend provenance record");
-                        }
-                    }
-                }
 
                 let has_collection = if embeddings_enabled {
                     match state.vector_store.has_collection(&collection_name).await {
@@ -2025,7 +2009,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_backend_switch_refuses_until_forced() {
+    async fn test_backend_switch_requires_clear() {
         let temp_dir = TempDir::new().unwrap();
         let root = temp_dir.path();
         let cache_dir = TempDir::new().unwrap();
@@ -2087,7 +2071,16 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("vector backend"));
 
-        // The explicit override re-homes the index and rewrites provenance.
+        // Even --force refuses: re-homing without retiring the recorded
+        // backend's collection would let it authenticate the new manifest.
+        let err = index_codebase(&make_local_state(), root, true)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("vector backend"));
+
+        // After clear retires the record (the sanctioned re-homing path),
+        // indexing into the new backend proceeds and rewrites provenance.
+        ManifestStore.clear_backend(root).unwrap();
         let rebuilt = index_codebase(&make_local_state(), root, true)
             .await
             .unwrap();
