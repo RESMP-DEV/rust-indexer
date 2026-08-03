@@ -172,12 +172,13 @@ async fn run_index_codebase(
         // own right: a collection built from an empty repository holds zero
         // vectors, yet advancing the shared manifest past it lexically would
         // let the sibling skip populating it forever.
-        let recorded_backend = state
-            .manifest_store
-            .load_backend(path)
-            .ok()
-            .flatten()
-            .is_some();
+        let recorded_backend = match state.manifest_store.load_backend(path) {
+            Ok(record) => record.is_some(),
+            Err(e) => {
+                refuse_before_mutation(state, path, previous_status_before_index.as_ref()).await;
+                return Err(e).context("Failed to read backend provenance record");
+            }
+        };
         if has_semantic || status_reports_vectors || recorded_backend {
             refuse_before_mutation(state, path, previous_status_before_index.as_ref()).await;
             anyhow::bail!(
@@ -275,7 +276,16 @@ async fn run_index_codebase(
                                 current_backend
                             );
                         }
-                        _ => {}
+                        Ok(_) => {}
+                        Err(e) => {
+                            refuse_before_mutation(
+                                state,
+                                path,
+                                previous_status_before_index.as_ref(),
+                            )
+                            .await;
+                            return Err(e).context("Failed to read backend provenance record");
+                        }
                     }
                 }
 

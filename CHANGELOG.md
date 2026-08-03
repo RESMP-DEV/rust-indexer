@@ -5,6 +5,10 @@
 - Fix: parse `upsertCount` from Milvus upsert responses (the endpoint switch
   to upsert left the client reading only `insertCount`, so every accepted
   batch counted as zero vectors and indexing aborted).
+- Fix: I/O errors while reading the manifest or provenance record propagate
+  instead of degrading to "no provenance", which would have bypassed the
+  backend-mismatch safeguards; search treats such errors like a mismatch
+  (semantic skipped, lexical served).
 
 - Initial fork from rust_sindexer (MCP server variant) as a standalone CLI
   with clap subcommands `index`, `update`, `search`, `status`, `clear`, and

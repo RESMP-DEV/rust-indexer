@@ -203,7 +203,7 @@ impl ManifestStore {
         let record: BackendRecord = serde_json::from_str(&contents).with_context(|| {
             format!("failed to parse backend record {}", backend_path.display())
         })?;
-        match current_manifest_sha256(path) {
+        match current_manifest_sha256(path)? {
             Some(current) if current == record.manifest_sha256 => Ok(Some(record.backend)),
             _ => {
                 debug!(
@@ -227,7 +227,7 @@ impl ManifestStore {
         }
         let json = serde_json::to_string_pretty(&BackendRecord {
             backend: backend.to_string(),
-            manifest_sha256: current_manifest_sha256(path).unwrap_or_default(),
+            manifest_sha256: current_manifest_sha256(path)?.unwrap_or_default(),
         })
         .context("failed to serialize backend record")?;
         fs::write(&backend_path, json).with_context(|| {
@@ -346,9 +346,20 @@ struct BackendRecord {
     manifest_sha256: String,
 }
 
-fn current_manifest_sha256(root: &Path) -> Option<String> {
-    let contents = fs::read(manifest_path(root)).ok()?;
-    Some(hex::encode(Sha256::digest(&contents)))
+/// Hash the current manifest file. NotFound means "no manifest" (Ok(None));
+/// any other I/O error propagates rather than silently degrading to absent
+/// provenance, which would bypass the backend-mismatch safeguard.
+fn current_manifest_sha256(root: &Path) -> Result<Option<String>> {
+    match fs::read(manifest_path(root)) {
+        Ok(contents) => Ok(Some(hex::encode(Sha256::digest(&contents)))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| {
+            format!(
+                "failed to read manifest {} while checking backend provenance",
+                manifest_path(root).display()
+            )
+        }),
+    }
 }
 
 fn backend_path(root: &Path) -> PathBuf {

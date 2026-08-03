@@ -223,7 +223,14 @@ impl Indexer {
         // surviving same-named collection in the old backend would fuse
         // stale vectors into current results. Lexical retrieval stays valid
         // either way, so skip semantic instead of failing the search.
+        // An error reading provenance is treated like a mismatch (skip
+        // semantic, keep lexical) rather than as absent: silently degrading
+        // would bypass the safeguard.
         let provenance_ok = match self.state.manifest_store.load_backend(path) {
+            Err(e) => {
+                warn!(error = %e, "Failed to read backend provenance; skipping semantic hits");
+                false
+            }
             Ok(Some(recorded)) => {
                 let current = self.state.vector_store.provenance();
                 if recorded == current {
@@ -237,7 +244,7 @@ impl Indexer {
                     false
                 }
             }
-            _ => true,
+            Ok(None) => true,
         };
 
         let semantic_start = Instant::now();
@@ -343,7 +350,12 @@ impl Indexer {
         // vector count: even an empty collection in the recorded backend
         // must be dropped by that backend, or a later rebuild would let the
         // surviving collection shadow the new index.
-        if let Ok(Some(recorded)) = self.state.manifest_store.load_backend(path) {
+        if let Some(recorded) = self
+            .state
+            .manifest_store
+            .load_backend(path)
+            .context("failed to read backend provenance record")?
+        {
             let current = self.state.vector_store.provenance();
             if recorded != current {
                 bail!(
