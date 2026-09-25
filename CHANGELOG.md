@@ -4,7 +4,13 @@
 
 - Add the B550 deployment for direct CUDA MXFP4 Jina embeddings, remote
   Milvus persistence, automatic selection of the 3090 Ti with the most free
-  VRAM, and a loopback-only SSH tunnel from the Mac.
+  VRAM, and a loopback-only SSH tunnel from the Mac. Review hardening: MinIO
+  is no longer published on host ports and its credentials moved from the
+  compose file into an untracked `deploy/b550/.env` (see `.env.example`);
+  the embedding server rejects oversized request bodies and oversized
+  individual inputs with HTTP 413 before tokenization; and both systemd
+  units gate on real readiness, the embedding one through an ExecStartPost
+  `/health` poll and the Milvus one through `docker compose up -d --wait`.
 
 - Manifest parity with rust_sindexer PR #12: `IndexInputs` records
   `embedding_dimension` (serde default 0 for older manifests), so a
