@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add the B550 deployment for direct CUDA MXFP4 Jina embeddings, remote
+  Milvus persistence, automatic selection of the 3090 Ti with the most free
+  VRAM, and a loopback-only SSH tunnel from the Mac.
+
 - Manifest parity with rust_sindexer PR #12: `IndexInputs` records
   `embedding_dimension` (serde default 0 for older manifests), so a
   dimension change invalidates the shared manifest identically in both
